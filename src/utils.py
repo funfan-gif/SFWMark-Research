@@ -25,6 +25,7 @@ import lpips
 
 from pytorch_fid.fid_score import *
 from compressai.zoo import bmshj2018_hyperprior, cheng2020_anchor #bmshj2018_factorized
+from research_attacks import rotate_pair
 
 # ====================================================================================================
 # [Global variables]
@@ -480,9 +481,12 @@ def image_distortion(img1, img2, seed,
                      bm3d_sigma = None,
                      vaeb_quality = None,
                      vaec_quality = None,
-                     center_crop_area_ratio = None,
-                     random_crop_area_ratio = None,
-                     ):
+                      center_crop_area_ratio = None,
+                      random_crop_area_ratio = None,
+                      rotation_angle = None,
+                      rotation_interpolation = "bilinear",
+                      orthogonal_rotation = False,
+                      ):
     if brightness_factor is not None:
         if img1 is not None:
             img1 = tforms.ColorJitter(brightness=brightness_factor)(img1)
@@ -550,6 +554,14 @@ def image_distortion(img1, img2, seed,
         if img1 is not None:
             img1 = random_crop_transforms(img1)
         img2 = random_crop_transforms(img2)
+    if rotation_angle is not None:
+        img1, img2 = rotate_pair(
+            img1,
+            img2,
+            angle=rotation_angle,
+            interpolation=rotation_interpolation,
+            orthogonal_exact=orthogonal_rotation,
+        )
     return [img1, img2]
 
 # ====================================================================================================

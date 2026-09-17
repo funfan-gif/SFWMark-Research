@@ -9,6 +9,8 @@ import torch
 from diffusers import DiffusionPipeline, DDIMScheduler
 
 from utils import *
+from freeu import configure_freeu
+from research_config import FREEU_DEFAULTS, FreeUConfig
 
 # main 함수
 def main(args):
@@ -38,6 +40,13 @@ def main(args):
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
     pipe = pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
+    configure_freeu(pipe, FreeUConfig(
+        enabled=getattr(args, "generation_freeu", False),
+        s1=getattr(args, "freeu_s1", FREEU_DEFAULTS.s1),
+        s2=getattr(args, "freeu_s2", FREEU_DEFAULTS.s2),
+        b1=getattr(args, "freeu_b1", FREEU_DEFAULTS.b1),
+        b2=getattr(args, "freeu_b2", FREEU_DEFAULTS.b2),
+    ))
 
     # [Make GT patterns] wm_capacity=2048
     if args.wm_type == "Tree-Ring":
@@ -126,6 +135,10 @@ if __name__ == "__main__":
     parser.add_argument("--wm_type", choices=["Tree-Ring", "RingID", "HSTR", "HSQR"], required=True, help="Choose semantic watermarking methods following merged-in-generation scheme")
     parser.add_argument("--dataset_id", choices=["coco", "Gustavo", "DB1k"], required=True, help="Choose dataset_id")
     parser.add_argument("--output_dir", default="outputs", help="output directory: ./[output_dir]/")
+    parser.add_argument("--generation_freeu", action="store_true", help="Enable FreeU during generation")
+    parser.add_argument("--freeu_s1", type=float, default=FREEU_DEFAULTS.s1)
+    parser.add_argument("--freeu_s2", type=float, default=FREEU_DEFAULTS.s2)
+    parser.add_argument("--freeu_b1", type=float, default=FREEU_DEFAULTS.b1)
+    parser.add_argument("--freeu_b2", type=float, default=FREEU_DEFAULTS.b2)
     args = parser.parse_args()
     main(args)
-    
