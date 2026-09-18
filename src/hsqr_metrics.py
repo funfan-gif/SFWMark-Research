@@ -123,6 +123,7 @@ def l2_from_features(query, reference) -> np.ndarray:
 class HSQRDistanceModel:
     """Diagonal and full-whitening models fitted on correct-key residuals."""
 
+    residual_mean: Optional[np.ndarray] = None
     diagonal_variance: Optional[np.ndarray] = None
     cholesky: Optional[np.ndarray] = None
     shrinkage: Optional[float] = None
@@ -138,6 +139,7 @@ class HSQRDistanceModel:
         residuals = queries - references
 
         estimator = LedoitWolf(assume_centered=False).fit(residuals)
+        self.residual_mean = np.asarray(estimator.location_, dtype=np.float64)
         covariance = np.asarray(estimator.covariance_, dtype=np.float64)
         diagonal = np.diag(covariance).copy()
         positive = diagonal[diagonal > 0]
@@ -161,7 +163,8 @@ class HSQRDistanceModel:
         return self
 
     def _require_fit(self):
-        if self.diagonal_variance is None or self.cholesky is None:
+        if (self.residual_mean is None or self.diagonal_variance is None
+                or self.cholesky is None):
             raise RuntimeError("Call fit() or load() before covariance distances")
 
     def diagonal_distance(self, query, references, chunk_size: int = 128) -> np.ndarray:
@@ -179,12 +182,13 @@ class HSQRDistanceModel:
         for start in range(0, references.shape[0], chunk_size):
             ref = references[start:start + chunk_size]
             residual = queries[:, None, :] - ref[None, :, :]
+            centered = residual - self.residual_mean[None, None, :]
             if metric == "diag":
                 distance = np.sqrt(
-                    np.sum(residual * residual / self.diagonal_variance, axis=-1)
+                    np.sum(centered * centered / self.diagonal_variance, axis=-1)
                 )
             else:
-                flat = residual.reshape(-1, residual.shape[-1]).T
+                flat = centered.reshape(-1, centered.shape[-1]).T
                 whitened = solve_triangular(
                     self.cholesky, flat, lower=True, check_finite=False
                 )
@@ -211,6 +215,61 @@ class HSQRDistanceModel:
                 raise ValueError(f"Unknown HSQR distance: {metric}")
         return result
 
+    def prepare_references(self, references) -> Dict[str, np.ndarray]:
+        """Pre-whiten a fixed candidate bank once for repeated identification.
+
+        Linearity gives ``L^-1(q-r-mean) = L^-1(q-mean)-L^-1(r)``.  This keeps
+        the exact centered Mahalanobis definition while avoiding a triangular
+        solve over all 2048 keys for every evaluated image.
+        """
+
+        self._require_fit()
+        references = _as_2d_float64(references)
+        return {
+            "raw": references,
+            "diag": references / np.sqrt(self.diagonal_variance)[None, :],
+            "mahalanobis": solve_triangular(
+                self.cholesky, references.T, lower=True, check_finite=False
+            ).T,
+        }
+
+    def distances_to_prepared(self, query, prepared,
+                              metrics: Sequence[str] = (
+                                  "complex_l1", "l2", "diag", "mahalanobis"
+                              )) -> Dict[str, np.ndarray]:
+        """Distances to a bank returned by :meth:`prepare_references`."""
+
+        queries = _as_2d_float64(query)
+        raw = prepared["raw"]
+        result = {}
+        for metric in metrics:
+            if metric == "complex_l1":
+                result[metric] = complex_l1_from_features(queries, raw)
+            elif metric == "l2":
+                result[metric] = l2_from_features(queries, raw)
+            elif metric == "diag":
+                transformed = (
+                    (queries - self.residual_mean[None, :])
+                    / np.sqrt(self.diagonal_variance)[None, :]
+                )
+                result[metric] = np.linalg.norm(
+                    transformed[:, None, :] - prepared["diag"][None, :, :], axis=-1
+                )
+            elif metric == "mahalanobis":
+                transformed = solve_triangular(
+                    self.cholesky,
+                    (queries - self.residual_mean[None, :]).T,
+                    lower=True,
+                    check_finite=False,
+                ).T
+                result[metric] = np.linalg.norm(
+                    transformed[:, None, :] - prepared["mahalanobis"][None, :, :],
+                    axis=-1,
+                )
+            else:
+                raise ValueError(f"Unknown HSQR distance: {metric}")
+        return result
+
     def identify(self, query, candidate_references, metric: str,
                  chunk_size: int = 128) -> np.ndarray:
         """Argmin over every candidate key; no ground-truth key is accepted here."""
@@ -226,6 +285,7 @@ class HSQRDistanceModel:
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             path,
+            residual_mean=self.residual_mean,
             diagonal_variance=self.diagonal_variance,
             cholesky=self.cholesky,
             shrinkage=np.array(self.shrinkage),
@@ -235,8 +295,14 @@ class HSQRDistanceModel:
     @classmethod
     def load(cls, path) -> "HSQRDistanceModel":
         with np.load(path) as data:
+            diagonal_variance = data["diagonal_variance"].copy()
             return cls(
-                diagonal_variance=data["diagonal_variance"].copy(),
+                residual_mean=(
+                    data["residual_mean"].copy()
+                    if "residual_mean" in data.files
+                    else np.zeros_like(diagonal_variance)
+                ),
+                diagonal_variance=diagonal_variance,
                 cholesky=data["cholesky"].copy(),
                 shrinkage=float(data["shrinkage"]),
                 jitter=float(data["jitter"]),

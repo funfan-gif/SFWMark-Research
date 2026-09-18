@@ -1,5 +1,6 @@
 import os
 import itertools
+import json
 from tqdm import tqdm
 from pathlib import Path
 
@@ -16,7 +17,10 @@ from research_config import FREEU_DEFAULTS, FreeUConfig
 def main(args):
     set_random_seed(42)
     project_root = Path(__file__).resolve().parent.parent
-    save_dir = project_root / f"{args.output_dir}/{args.dataset_id}/{args.wm_type}"
+    output_root = Path(args.output_dir)
+    if not output_root.is_absolute():
+        output_root = project_root / output_root
+    save_dir = output_root / args.dataset_id / args.wm_type
     os.makedirs(os.path.join(save_dir, "img_pil"), exist_ok=True)
     os.makedirs(os.path.join(save_dir, "img_pil_wm"), exist_ok=True)
 
@@ -25,20 +29,43 @@ def main(args):
 
     # [Evaluation Settings]
     num_dataset = len(meta_annot)
-    RANGE_EVAL = range(0,num_dataset)
+    sample_start = int(getattr(args, "sample_start", 0))
+    sample_count = getattr(args, "sample_count", None)
+    if sample_start < 0 or sample_start >= num_dataset:
+        raise ValueError(f"sample_start must be in [0,{num_dataset}), got {sample_start}")
+    sample_stop = num_dataset if sample_count is None else min(
+        sample_start + int(sample_count), num_dataset
+    )
+    if sample_count is not None and int(sample_count) <= 0:
+        raise ValueError("sample_count must be positive")
+    RANGE_EVAL = range(sample_start, sample_stop)
     w_seed_list = [*range(w_seed, w_seed + wm_capacity)] # 2048 seed numbers
     identify_gt_indices = np.random.choice(wm_capacity, size=num_dataset).tolist()
     np.save(os.path.join(save_dir, f"identify_gt_indices_{num_dataset}.npy"), identify_gt_indices)
-    
+
     # [Stable-Diffusion-v2-1-base Settings]
-    model_id = "stabilityai/stable-diffusion-2-1-base"
+    model_id = getattr(args, "model_id", "stabilityai/stable-diffusion-2-1-base")
+    model_revision = getattr(args, "model_revision", None)
+    local_files_only = bool(getattr(args, "local_files_only", False))
     resolution = 512
-    torch_dtype = torch.float32
+    dtype_name = getattr(args, "torch_dtype", "float32")
+    torch_dtype = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[dtype_name]
+    target_device = getattr(args, "device", device)
 
     # [Load Stable-Diffusion pipeline]
-    pipe = DiffusionPipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
+    load_kwargs = {
+        "torch_dtype": torch_dtype,
+        "local_files_only": local_files_only,
+    }
+    if model_revision is not None:
+        load_kwargs["revision"] = model_revision
+    pipe = DiffusionPipeline.from_pretrained(model_id, **load_kwargs)
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-    pipe = pipe.to(device)
+    pipe = pipe.to(target_device)
     pipe.set_progress_bar_config(disable=True)
     configure_freeu(pipe, FreeUConfig(
         enabled=getattr(args, "generation_freeu", False),
@@ -81,6 +108,33 @@ def main(args):
     # [Save Fourier_watermark_pattern_list]
     torch.save(torch.stack(Fourier_watermark_pattern_list, 0).detach(), os.path.join(save_dir, f"pattern_list-{wm_capacity}.pt"))
 
+    save_gt_latents = bool(getattr(args, "save_gt_latents", False))
+    if save_gt_latents:
+        os.makedirs(save_dir / "gt_latents_no_wm", exist_ok=True)
+        os.makedirs(save_dir / "gt_latents_wm", exist_ok=True)
+
+    manifest = {
+        "sample_start": sample_start,
+        "sample_stop": sample_stop,
+        "sample_count": sample_stop - sample_start,
+        "dataset_size": num_dataset,
+        "model_id": str(model_id),
+        "model_revision": model_revision,
+        "local_files_only": local_files_only,
+        "torch_dtype": dtype_name,
+        "generation_freeu": bool(getattr(args, "generation_freeu", False)),
+        "freeu": {
+            "s1": getattr(args, "freeu_s1", FREEU_DEFAULTS.s1),
+            "s2": getattr(args, "freeu_s2", FREEU_DEFAULTS.s2),
+            "b1": getattr(args, "freeu_b1", FREEU_DEFAULTS.b1),
+            "b2": getattr(args, "freeu_b2", FREEU_DEFAULTS.b2),
+        },
+        "save_gt_latents": save_gt_latents,
+    }
+    with open(save_dir / f"generation_manifest-{sample_start}-{sample_stop}.json", "w",
+              encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+
     print("Generation Starts")
     batch_size = 8
     for batch_start in tqdm(range(0, len(RANGE_EVAL), batch_size)):
@@ -90,7 +144,9 @@ def main(args):
         gen_prompts = [meta_annot[idx][prompt_key] for idx in batch_indices]
         file_names = [f"{idx}.png" for idx in batch_indices]
         # Set random seeds
-        set_random_seed(42 + batch_start)
+        # Seed by the first absolute sample id so G0/G1 stay paired even when
+        # generation is executed in a requested sub-range.
+        set_random_seed(42 + batch_indices[0])
 
         with torch.no_grad():
             key_indices = [identify_gt_indices[key] for key in batch_indices]
@@ -108,11 +164,25 @@ def main(args):
             no_watermark_latents = get_random_latents(pipe, batch_size=batch_size_actual) # (N,4,64,64)
             # watermark injection
             if args.wm_type in ["Tree-Ring", "RingID"]:
-                Fourier_watermark_latents, _ = inject_wm(no_watermark_latents, pattern_gt_batch, masks, cut_real=True, device=device)
+                Fourier_watermark_latents, _ = inject_wm(no_watermark_latents, pattern_gt_batch, masks, cut_real=True, device=target_device)
             elif args.wm_type == "HSTR":
-                Fourier_watermark_latents, _ = inject_wm(no_watermark_latents, pattern_gt_batch, masks, center=True, cut_real=False, device=device)
+                Fourier_watermark_latents, _ = inject_wm(no_watermark_latents, pattern_gt_batch, masks, center=True, cut_real=False, device=target_device)
             elif args.wm_type == "HSQR":
-                Fourier_watermark_latents = inject_hsqr(no_watermark_latents, pattern_gt_batch, center=True, device=device)
+                Fourier_watermark_latents = inject_hsqr(
+                    no_watermark_latents, pattern_gt_batch, center=True,
+                    device=target_device,
+                )
+
+            if save_gt_latents:
+                for row, idx in enumerate(batch_indices):
+                    torch.save(
+                        no_watermark_latents[row].detach().cpu(),
+                        save_dir / "gt_latents_no_wm" / f"{idx}.pt",
+                    )
+                    torch.save(
+                        Fourier_watermark_latents[row].detach().cpu(),
+                        save_dir / "gt_latents_wm" / f"{idx}.pt",
+                    )
             
             # generate images
             batched_latents = torch.cat([no_watermark_latents, Fourier_watermark_latents], dim=0) # (2N,4,64,64)
@@ -135,6 +205,14 @@ if __name__ == "__main__":
     parser.add_argument("--wm_type", choices=["Tree-Ring", "RingID", "HSTR", "HSQR"], required=True, help="Choose semantic watermarking methods following merged-in-generation scheme")
     parser.add_argument("--dataset_id", choices=["coco", "Gustavo", "DB1k"], required=True, help="Choose dataset_id")
     parser.add_argument("--output_dir", default="outputs", help="output directory: ./[output_dir]/")
+    parser.add_argument("--sample_start", type=int, default=0)
+    parser.add_argument("--sample_count", type=int)
+    parser.add_argument("--model_id", default="stabilityai/stable-diffusion-2-1-base")
+    parser.add_argument("--model_revision")
+    parser.add_argument("--local_files_only", action="store_true")
+    parser.add_argument("--torch_dtype", choices=("float32", "float16", "bfloat16"), default="float32")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--save_gt_latents", action="store_true")
     parser.add_argument("--generation_freeu", action="store_true", help="Enable FreeU during generation")
     parser.add_argument("--freeu_s1", type=float, default=FREEU_DEFAULTS.s1)
     parser.add_argument("--freeu_s2", type=float, default=FREEU_DEFAULTS.s2)

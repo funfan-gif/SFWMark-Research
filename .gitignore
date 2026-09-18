@@ -8,6 +8,7 @@ docs/static/png
 src/text_dataset/
 outputs/
 quick_outputs/
+research_outputs/
 
 # Python files
 z/

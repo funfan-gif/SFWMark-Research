@@ -31,6 +31,17 @@ class FeatureCacheKey:
     inversion_hyperparameters: Mapping[str, Any]
     generation_freeu: Mapping[str, Any]
     inversion_freeu: Mapping[str, Any]
+    generation_group: str
+    model_id: str
+    model_revision: Any
+    diffusers_version: str
+    torch_version: str
+    torch_dtype: str
+    num_inference_steps: int
+    invert_guidance: float
+    invert_prompt: Any
+    git_commit: str
+    source_image_sha256: str
     attack: str
     attack_parameters: Mapping[str, Any]
     dataset_id: str

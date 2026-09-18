@@ -1,10 +1,11 @@
-"""Unified DDIM, Exact-DDIM, and GNRI inversion for Stable Diffusion 2.1.
+"""Unified DDIM and research inversion adaptations for Stable Diffusion 2.1.
 
 The VAE path intentionally matches the original SFWMark implementation: resize
 to 512, map to [-1, 1], use the posterior mode, and apply the VAE scaling
 factor.  Decoder inversion is deliberately outside the scope of this module.
 """
 
+import json
 from dataclasses import asdict, dataclass
 from typing import List, Optional, Sequence, Union
 
@@ -28,24 +29,30 @@ class InversionConfig:
     prompt: Prompt = ""
     negative_prompt: Optional[Prompt] = None
 
-    # Exact-DDIM: Algorithm 1 refinement (forward step or latent gradient).
+    # Exact-DPM-inspired first-order forward-step DDIM refinement.  This is not
+    # the complete higher-order Exact-DPM pipeline or decoder inversion.
     exact_max_iterations: int = 5
     exact_tolerance: float = 1e-5
     exact_step_size: float = 0.5
     exact_update: str = "forward"
 
-    # Guided Newton-Raphson Inversion (paper Eq. 9-10).
+    # GNRI official-semantics adaptation for the SD2.1 DDIM scheduler.
     gnri_max_iterations: int = 2
     gnri_tolerance: float = 1e-4
     gnri_lambda: float = 0.1
-    gnri_eta: float = 1e-6
+    # Official code divides directly by the component gradient.  A non-zero
+    # eta is retained only as an explicit numerical-stability experiment.
+    gnri_eta: float = 0.0
     gnri_step_scale: float = 1.0
     gnri_max_update_norm: Optional[float] = None
+    diagnostics: bool = False
 
     inversion_freeu: FreeUConfig = FreeUConfig()
 
     def cache_dict(self):
         result = asdict(self)
+        # Diagnostics only change logging, never recovered features.
+        result.pop("diagnostics", None)
         result["prompt"] = list(self.prompt) if not isinstance(self.prompt, str) else self.prompt
         if self.negative_prompt is not None and not isinstance(self.negative_prompt, str):
             result["negative_prompt"] = list(self.negative_prompt)
@@ -54,6 +61,19 @@ class InversionConfig:
 
 def _pipe_device(pipe) -> torch.device:
     return torch.device(getattr(pipe, "_execution_device", pipe.device))
+
+
+def _diagnostic(enabled: bool, event: str, **values) -> None:
+    if not enabled:
+        return
+    serializable = {"event": event}
+    for key, value in values.items():
+        if isinstance(value, torch.Tensor):
+            value = value.detach().float().cpu()
+            serializable[key] = value.tolist() if value.ndim else value.item()
+        else:
+            serializable[key] = value
+    print("RESEARCH_DIAGNOSTIC " + json.dumps(serializable, sort_keys=True))
 
 
 def _as_image_list(images) -> List[Image.Image]:
@@ -170,7 +190,7 @@ def _replace_rows(old: torch.Tensor, new: torch.Tensor, mask: torch.Tensor) -> t
 
 
 def exact_ddim_invert(pipe, images, config: InversionConfig) -> torch.Tensor:
-    """Exact-DDIM refinement using the implicit backward-Euler residual.
+    """Exact-DPM-inspired first-order forward-step DDIM refinement.
 
     Each step starts from ordinary DDIM inversion, then refines the candidate
     noisy latent so a deterministic DDIM denoising step maps it back to the
@@ -201,7 +221,9 @@ def exact_ddim_invert(pipe, images, config: InversionConfig) -> torch.Tensor:
         best_error = torch.full(
             (candidate.shape[0],), float("inf"), device=candidate.device, dtype=torch.float32
         )
-        for _ in range(config.exact_max_iterations):
+        iterations_run = 0
+        for iteration in range(config.exact_max_iterations):
+            iterations_run = iteration + 1
             candidate = candidate.detach().requires_grad_(config.exact_update == "gradient")
             context = torch.enable_grad() if config.exact_update == "gradient" else torch.no_grad()
             with context:
@@ -217,6 +239,15 @@ def exact_ddim_invert(pipe, images, config: InversionConfig) -> torch.Tensor:
             improved = mse < best_error
             best = _replace_rows(best, candidate.detach(), improved)
             best_error = torch.where(improved, mse.detach(), best_error)
+            residual_rms = torch.sqrt(mse.detach())
+            _diagnostic(
+                config.diagnostics,
+                "exact_ddim_refinement",
+                timestep=int(timestep),
+                iteration=iterations_run,
+                reconstruction_residual_rms=residual_rms,
+                best_residual_rms=torch.sqrt(best_error),
+            )
             if torch.sqrt(mse).max().item() <= config.exact_tolerance:
                 break
 
@@ -228,40 +259,51 @@ def exact_ddim_invert(pipe, images, config: InversionConfig) -> torch.Tensor:
                 candidate = candidate - config.exact_step_size * residual
 
         latent = best.detach()
+        _diagnostic(
+            config.diagnostics,
+            "exact_ddim_timestep_complete",
+            timestep=int(timestep),
+            iteration_count=iterations_run,
+            best_residual_rms=torch.sqrt(best_error),
+        )
     return latent
 
 
-def _ddim_step_prior(inverse, target: torch.Tensor, timestep):
-    """Return (mu, beta) for q(z_t | z_{t-1}) on the subsampled DDIM step."""
+def _ddim_timestamp_log_probability(inverse, value: torch.Tensor,
+                                    image_latent: torch.Tensor, timestep):
+    """DDIM adaptation of GNRI's ``get_timestamp_dist``.
+
+    The official SDXL/Euler implementation evaluates a detached implicit-map
+    output under the timestamp Gaussian around the encoded image latent.  A
+    DDIM scheduler has no public ``sigmas`` array in that parameterization, so
+    this adaptation uses the standard forward-diffusion marginal
+    q(z_t | z_0) = N(sqrt(alpha_bar_t) z_0, (1-alpha_bar_t) I).  The returned
+    log probability remains detached and only guides the scalar Newton
+    numerator, as in the official implementation.
+    """
 
     t = int(timestep.item()) if isinstance(timestep, torch.Tensor) else int(timestep)
-    step = inverse.config.num_train_timesteps // inverse.num_inference_steps
-    lower_t = t - step
-    alpha_high = inverse.alphas_cumprod[t].to(device=target.device, dtype=target.dtype)
-    if lower_t < 0:
-        alpha_low = inverse.initial_alpha_cumprod.to(
-            device=target.device, dtype=target.dtype
-        )
-    else:
-        alpha_low = inverse.alphas_cumprod[lower_t].to(
-            device=target.device, dtype=target.dtype
-        )
-    alpha_ratio = (alpha_high / alpha_low).clamp(min=1e-8, max=1.0)
-    beta = (1.0 - alpha_ratio).clamp_min(1e-8)
-    return alpha_ratio.sqrt() * target, beta
+    alpha_bar = inverse.alphas_cumprod[t].to(device=value.device, dtype=value.dtype)
+    variance = (1.0 - alpha_bar).clamp_min(1e-8)
+    mean = alpha_bar.sqrt() * image_latent
+    return -0.5 * (value - mean).square() / variance
 
 
 def gnri_invert(pipe, images, config: InversionConfig) -> torch.Tensor:
-    """Guided Newton-Raphson inversion for DDIM / Stable Diffusion 2.1.
+    """Official-semantics GNRI adaptation for DDIM / Stable Diffusion 2.1.
 
-    This implements the scalar objective and component-wise Newton update from
-    GNRI Eq. (9)-(10).  Gradients are taken only with respect to the candidate
-    latent; U-Net weights are never optimized.
+    Like the official ICLR 2025 implementation, U-Net prediction and the
+    implicit scheduler mapping are evaluated under ``no_grad`` and detached.
+    The candidate latent is the sole Newton variable.  This deliberately avoids
+    differentiating through the U-Net and is not ordinary latent gradient
+    descent.  The scheduler-specific Gaussian is adapted as documented in
+    :func:`_ddim_timestamp_log_probability`.
     """
 
     if config.gnri_max_iterations < 1:
         raise ValueError("gnri_max_iterations must be positive")
-    latent = encode_images(pipe, images)
+    image_latent = encode_images(pipe, images)
+    latent = image_latent
     prompt_embeds = _encode_prompt(
         pipe, config.prompt, config.negative_prompt, latent.shape[0], config.guidance_scale
     )
@@ -270,46 +312,75 @@ def gnri_invert(pipe, images, config: InversionConfig) -> torch.Tensor:
     for timestep in inverse.timesteps:
         target = latent.detach()
         candidate = target.clone()
-        prior_mean, prior_beta = _ddim_step_prior(inverse, target, timestep)
         dimension = candidate[0].numel()
         best = candidate
-        best_residual = torch.full(
-            (candidate.shape[0],), float("inf"), device=candidate.device, dtype=torch.float32
-        )
+        best_objective = float("inf")
 
-        for _ in range(config.gnri_max_iterations):
+        for iteration in range(config.gnri_max_iterations):
             candidate = candidate.detach().requires_grad_(True)
-            with torch.enable_grad():
+            # Official GNRI semantics: the learned model and implicit mapping
+            # are constants for the component-wise Newton derivative.
+            with torch.no_grad():
                 model_output = _predict_model_output(
                     pipe, inverse, candidate, timestep, prompt_embeds, config.guidance_scale
                 )
-                implicit_map = inverse.step(model_output, timestep, target).prev_sample
-                root = candidate - implicit_map
-                residual_score = root.float().abs().flatten(1).mean(dim=1)
-                root_objective = root.abs().flatten(1).sum(dim=1)
-                guidance_objective = (
-                    0.5 * (candidate - prior_mean).float().square() / prior_beta.float()
-                ).flatten(1).sum(dim=1)
-                objective = root_objective + config.gnri_lambda * guidance_objective
+                implicit_map = inverse.step(
+                    model_output, timestep, target
+                ).prev_sample.detach()
+                log_probability = _ddim_timestamp_log_probability(
+                    inverse, implicit_map, image_latent, timestep
+                ).detach()
 
-            improved = residual_score < best_residual
-            best = _replace_rows(best, implicit_map.detach(), improved)
-            best_residual = torch.where(improved, residual_score.detach(), best_residual)
-            if residual_score.max().item() <= config.gnri_tolerance:
+            root = implicit_map - candidate
+            root_residual = root.detach().float().abs().flatten(1).mean(dim=1)
+            # Official structure: |f(x)-x| - alpha * log p_t(f(x)).  The
+            # detached prior changes the scalar numerator, not its derivative.
+            objective_components = root.abs() - config.gnri_lambda * log_probability
+            objective = objective_components.float().sum()
+            objective_score = objective.detach() / float(objective_components.numel())
+
+            # The official implementation performs one scalar root solve and
+            # keeps the complete mapped latent with the lowest mean score.
+            if objective_score.item() < best_objective:
+                best = implicit_map.detach()
+                best_objective = objective_score.item()
+            if root_residual.max().item() <= config.gnri_tolerance:
+                _diagnostic(
+                    config.diagnostics,
+                    "gnri_iteration",
+                    timestep=int(timestep),
+                    iteration=iteration + 1,
+                    objective=objective_score,
+                    root_residual=root_residual,
+                    update_norm=torch.zeros_like(root_residual),
+                    non_finite=False,
+                )
                 break
 
             gradient = torch.autograd.grad(objective.sum(), candidate, only_inputs=True)[0]
             denominator = gradient + config.gnri_eta
-            update = (objective / float(dimension)).view(
-                (-1,) + (1,) * (candidate.ndim - 1)
-            ) / denominator
+            # Component-wise Newton update from the official code:
+            # x <- x - (1 / D) * objective / grad(objective), D=4*64*64.
+            update = (objective / float(dimension)) / denominator
 
             if config.gnri_max_update_norm is not None:
                 flat_norm = update.float().flatten(1).norm(dim=1).clamp_min(1e-12)
                 scale = (config.gnri_max_update_norm / flat_norm).clamp(max=1.0)
                 update = update * scale.view((-1,) + (1,) * (update.ndim - 1))
             next_candidate = candidate - config.gnri_step_scale * update
-            if not torch.isfinite(next_candidate).all():
+            update_norm = update.detach().float().flatten(1).norm(dim=1)
+            non_finite = not bool(torch.isfinite(next_candidate).all().item())
+            _diagnostic(
+                config.diagnostics,
+                "gnri_iteration",
+                timestep=int(timestep),
+                iteration=iteration + 1,
+                objective=objective_score,
+                root_residual=root_residual,
+                update_norm=update_norm,
+                non_finite=non_finite,
+            )
+            if non_finite:
                 break
             candidate = next_candidate
 
