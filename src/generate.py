@@ -12,6 +12,7 @@ from diffusers import DiffusionPipeline, DDIMScheduler
 from utils import *
 from freeu import configure_freeu
 from research_config import FREEU_DEFAULTS, FreeUConfig
+from runtime_profiling import RuntimeProfiler
 
 # main 함수
 def main(args):
@@ -55,6 +56,7 @@ def main(args):
         "bfloat16": torch.bfloat16,
     }[dtype_name]
     target_device = getattr(args, "device", device)
+    profiler = RuntimeProfiler(target_device)
 
     # [Load Stable-Diffusion pipeline]
     load_kwargs = {
@@ -63,6 +65,7 @@ def main(args):
     }
     if model_revision is not None:
         load_kwargs["revision"] = model_revision
+    profiler.start_model_load()
     pipe = DiffusionPipeline.from_pretrained(model_id, **load_kwargs)
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
     pipe = pipe.to(target_device)
@@ -74,6 +77,8 @@ def main(args):
         b1=getattr(args, "freeu_b1", FREEU_DEFAULTS.b1),
         b2=getattr(args, "freeu_b2", FREEU_DEFAULTS.b2),
     ))
+    profiler.finish_model_load()
+    profiler.attach_unet(pipe.unet)
 
     # [Make GT patterns] wm_capacity=2048
     if args.wm_type == "Tree-Ring":
@@ -137,6 +142,8 @@ def main(args):
 
     print("Generation Starts")
     batch_size = 8
+    profiler.record_requested_images(2 * len(RANGE_EVAL))
+    profiler.start_processing()
     for batch_start in tqdm(range(0, len(RANGE_EVAL), batch_size)):
         batch_indices = RANGE_EVAL[batch_start:batch_start+batch_size]
         batch_size_actual = len(batch_indices) # N
@@ -197,6 +204,29 @@ def main(args):
         for i, idx in enumerate(batch_indices):
             img_pils[i].save(os.path.join(save_dir, f"img_pil/{file_names[i]}"))
             img_pil_wms[i].save(os.path.join(save_dir, f"img_pil_wm/{file_names[i]}"))
+
+    profiler.record_processed_images(2 * len(RANGE_EVAL))
+    profiler.finish_processing()
+    profiler.close()
+    profiler.save(
+        save_dir / "research_results",
+        {
+            "experiment": getattr(args, "experiment", None),
+            "generation_pool": getattr(args, "generation_pool", None),
+            "stage": "generate",
+            "inversion": None,
+            "freeu_generation": bool(getattr(args, "generation_freeu", False)),
+            "freeu_inversion": None,
+            "freeu": manifest["freeu"],
+            "model_id": str(model_id),
+            "model_revision": model_revision,
+            "torch_dtype": dtype_name,
+            "sample_start": sample_start,
+            "sample_stop": sample_stop,
+            "source_sample_count": len(RANGE_EVAL),
+            "git_commit": getattr(args, "git_commit", "unknown"),
+        },
+    )
 
 
 if __name__ == "__main__":

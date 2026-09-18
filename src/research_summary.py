@@ -159,3 +159,47 @@ def summarize_results(result_dir, output_prefix="summary", whitening_model=None,
     print(f"Saved {json_path}")
     print(f"Saved {csv_path}")
     return payload
+
+
+RUNTIME_FIELDS = (
+    "experiment", "generation_pool", "stage", "inversion",
+    "freeu_generation", "freeu_inversion", "attacks", "num_images", "requested_images",
+    "cache_hit_images", "model_load_seconds", "processing_seconds",
+    "seconds_per_image", "inversion_processing_seconds",
+    "inversion_seconds_per_image", "peak_cuda_allocated_gb",
+    "peak_cuda_reserved_gb",
+    "unet_forward_calls", "unet_forward_calls_per_image", "inversion_steps",
+    "configured_inversion_steps", "total_refinement_iterations",
+    "total_newton_iterations", "model_id", "model_revision", "torch_dtype",
+    "diff_attack_model_id", "diff_attack_model_revision", "git_commit",
+    "model_reused_from_same_process", "runtime_recorded_at_utc", "source_file",
+)
+
+
+def summarize_runtime(runtime_dirs, output_dir):
+    """Write runtime profiles separately from verification/ID metrics."""
+
+    paths = set()
+    for directory in runtime_dirs:
+        directory = Path(directory)
+        paths.update(directory.glob("runtime-*.json"))
+    rows = []
+    for path in sorted(paths):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rows.append({
+            field: (str(path) if field == "source_file" else payload.get(field))
+            for field in RUNTIME_FIELDS
+        })
+    if not rows:
+        searched = ", ".join(str(Path(path)) for path in runtime_dirs)
+        raise FileNotFoundError(f"No runtime-*.json files in: {searched}")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "runtime-summary.csv"
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RUNTIME_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Saved {output_path}")
+    return rows

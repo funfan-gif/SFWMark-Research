@@ -38,7 +38,8 @@ from research_config import (
     ROTATION_BILINEAR_ANGLES,
     FreeUConfig,
 )
-from research_summary import summarize_results
+from research_summary import summarize_results, summarize_runtime
+from runtime_profiling import RuntimeProfiler
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -162,6 +163,34 @@ def _run_generation(args):
         torch_dtype=args.torch_dtype,
         device=args.device,
         save_gt_latents=args.save_gt_latents,
+        experiment=args.experiment,
+        generation_pool=experiment.generation_group,
+        git_commit=args.git_commit,
+    ))
+
+
+def _run_diff_attack(args):
+    from diff_attack.diff_wm_attack import run_diffusion_attack
+
+    experiment = EXPERIMENTS[args.experiment]
+    generation_root = _output_root(args) / experiment.generation_group
+    return run_diffusion_attack(SimpleNamespace(
+        output_dir=str(generation_root),
+        dataset_id=args.dataset_id,
+        wm_type="HSQR",
+        sample_start=args.sample_start,
+        sample_count=args.sample_count,
+        overwrite=args.overwrite,
+        device=args.device,
+        diff_attack_model_id=args.diff_attack_model_id,
+        diff_attack_model_revision=args.diff_attack_model_revision,
+        diff_attack_local_files_only=args.diff_attack_local_files_only,
+        experiment=args.experiment,
+        generation_pool=experiment.generation_group,
+        freeu_generation=experiment.generation_freeu.enabled,
+        model_id=args.model_id,
+        model_revision=args.model_revision,
+        git_commit=args.git_commit,
     ))
 
 
@@ -265,6 +294,12 @@ def _load_attacked_pair(args, attack: AttackSpec, index: int):
     no_path = no_dir / f"{index}.png"
     wm_path = wm_dir / f"{index}.png"
     if not no_path.is_file() or not wm_path.is_file():
+        if attack.name == "diff":
+            group = EXPERIMENTS[args.experiment].generation_group
+            raise FileNotFoundError(
+                f"Diff regeneration results missing for {group}. "
+                f"Run --stage diff_attack first. Missing: {no_path} / {wm_path}"
+            )
         raise FileNotFoundError(
             f"Missing attack input pair for sample {index}: {no_path} / {wm_path}"
         )
@@ -278,7 +313,7 @@ def _load_attacked_pair(args, attack: AttackSpec, index: int):
     )
 
 
-def _features_for_pair(pipe, cache, args, config, attack, index):
+def _features_for_pair(pipe, cache, args, config, attack, index, profiler=None):
     # Load/attack first so the cache key fingerprints the exact pixels consumed
     # by inversion, including regenerated Diff inputs.
     no_wm, wm = _load_attacked_pair(args, attack, index)
@@ -291,24 +326,57 @@ def _features_for_pair(pipe, cache, args, config, attack, index):
     }
     result = {}
     missing_kinds = []
+    if profiler is not None:
+        profiler.record_requested_images(len(images))
     for kind, key in keys.items():
         if cache.contains(key):
             result[kind] = cache.load(key).numpy()
+            if profiler is not None:
+                profiler.record_cache_hits(1)
         else:
             missing_kinds.append(kind)
 
     if missing_kinds:
+        calls_before = profiler.unet_forward_calls if profiler is not None else 0
+        inversion_started = profiler.start_inversion() if profiler is not None else None
         recovered = invert_image(
             pipe,
             [images[kind] for kind in missing_kinds],
             method=config.method,
             **_inversion_kwargs(config),
         )
+        if profiler is not None:
+            profiler.finish_inversion(inversion_started)
+            profiler.record_inversion(
+                config.method,
+                len(missing_kinds),
+                config.num_inference_steps,
+                calls_before,
+            )
         features = extract_hsqr_feature(recovered, center=True).detach().cpu().numpy()
         for row, kind in enumerate(missing_kinds):
             cache.store(keys[kind], features[row])
             result[kind] = features[row]
     return result["no_wm"], result["wm"]
+
+
+def _require_diff_results(args, attacks, indices):
+    if not any(attack.name == "diff" for attack in attacks):
+        return
+    generation_dir = _generation_dir(args)
+    missing = []
+    for index in sorted(set(indices)):
+        for directory in ("img_pil-diffatt_fp16", "img_pil_wm-diffatt_fp16"):
+            path = generation_dir / directory / f"{index}.png"
+            if not path.is_file():
+                missing.append(path)
+    if missing:
+        group = EXPERIMENTS[args.experiment].generation_group
+        preview = ", ".join(str(path) for path in missing[:3])
+        raise FileNotFoundError(
+            f"Diff regeneration results missing for {group}. "
+            f"Run --stage diff_attack first. Missing {len(missing)} file(s); first: {preview}"
+        )
 
 
 def _load_references_and_labels(generation_dir: Path):
@@ -370,7 +438,8 @@ def _write_model_metadata(path: Path, payload: dict):
     )
 
 
-def _fit(pipe, cache, args, config, attacks, references, labels, model_path):
+def _fit(pipe, cache, args, config, attacks, references, labels, model_path,
+         profiler=None):
     stop = min(args.fit_start + args.fit_count, len(labels))
     if args.fit_start < 0 or stop <= args.fit_start:
         raise ValueError("The fitting split is empty")
@@ -379,7 +448,7 @@ def _fit(pipe, cache, args, config, attacks, references, labels, model_path):
     for attack in attacks:
         for index in tqdm(range(args.fit_start, stop), desc=f"fit {attack.slug}"):
             _, wm_feature = _features_for_pair(
-                pipe, cache, args, config, attack, index
+                pipe, cache, args, config, attack, index, profiler=profiler
             )
             query_features.append(wm_feature)
             correct_references.append(references[int(labels[index])])
@@ -409,7 +478,8 @@ def _result_tag(args, config, attack, model_path):
     return digest[:12]
 
 
-def _evaluate(pipe, cache, args, config, attack, references, labels, model_path):
+def _evaluate(pipe, cache, args, config, attack, references, labels, model_path,
+              profiler=None):
     if not model_path.is_file():
         raise FileNotFoundError(f"Whitening model not found: {model_path}")
     model = HSQRDistanceModel.load(model_path)
@@ -429,7 +499,7 @@ def _evaluate(pipe, cache, args, config, attack, references, labels, model_path)
 
     for index in tqdm(range(args.eval_start, stop), desc=f"eval {attack.slug}"):
         no_feature, wm_feature = _features_for_pair(
-            pipe, cache, args, config, attack, index
+            pipe, cache, args, config, attack, index, profiler=profiler
         )
         key_index = int(labels[index])
         claimed_reference = references[key_index:key_index + 1]
@@ -476,29 +546,79 @@ def _oracle_model_path(args, config, attack):
     return _default_model_path(args, config, [attack], f"oracle-{attack.slug}")
 
 
+def _runtime_metadata(args, config, attacks, stage, model_reused=False):
+    experiment = EXPERIMENTS[args.experiment]
+    generation_freeu = _effective_freeu(args, experiment.generation_freeu.enabled)
+    return {
+        "experiment": args.experiment,
+        "generation_pool": experiment.generation_group,
+        "stage": stage,
+        "inversion": config.method,
+        "freeu_generation": generation_freeu.enabled,
+        "freeu_inversion": config.inversion_freeu.enabled,
+        "freeu": asdict(config.inversion_freeu),
+        "attacks": [attack.slug for attack in attacks],
+        "configured_inversion_steps": config.num_inference_steps,
+        "model_id": args.model_id,
+        "model_revision": args.model_revision,
+        "torch_dtype": args.torch_dtype,
+        "model_reused_from_same_process": model_reused,
+        "git_commit": args.git_commit,
+    }
+
+
+def _start_stage_profiler(pipe, args, model_load_seconds):
+    profiler = RuntimeProfiler(args.device)
+    profiler.model_load_seconds = model_load_seconds
+    profiler.attach_unet(pipe.unet)
+    profiler.start_processing()
+    return profiler
+
+
+def _finish_stage_profiler(profiler, args, config, attacks, stage,
+                           model_reused=False):
+    profiler.finish_processing()
+    profiler.close()
+    return profiler.save(
+        _experiment_dir(args) / "research_results",
+        _runtime_metadata(args, config, attacks, stage, model_reused=model_reused),
+    )
+
+
 def main(args):
     args.git_commit = _git_commit()
-    if args.oracle_attack_whitening and args.whitening_model:
-        raise ValueError(
-            "--oracle_attack_whitening and --whitening_model are mutually exclusive"
-        )
     if args.stage in ("generate", "all"):
         _run_generation(args)
         if args.stage == "generate":
             return
 
-    if args.stage == "summarize":
+    if args.stage == "diff_attack":
+        _run_diff_attack(args)
+        return
+
+    if args.stage in ("summarize", "summarize_runtime"):
         selected_model = (
             str(_resolve_model_path(args.whitening_model).resolve())
             if args.whitening_model else None
         )
-        summarize_results(
-            _experiment_dir(args) / "research_results",
-            output_prefix=args.summary_prefix,
-            whitening_model=selected_model,
-            allow_mixed_models=args.oracle_attack_whitening,
+        experiment_results = _experiment_dir(args) / "research_results"
+        generation_results = _generation_dir(args) / "research_results"
+        if args.stage == "summarize":
+            summarize_results(
+                experiment_results,
+                output_prefix=args.summary_prefix,
+                whitening_model=selected_model,
+                allow_mixed_models=args.oracle_attack_whitening,
+            )
+        summarize_runtime(
+            (experiment_results, generation_results), experiment_results
         )
         return
+
+    if args.oracle_attack_whitening and args.whitening_model:
+        raise ValueError(
+            "--oracle_attack_whitening and --whitening_model are mutually exclusive"
+        )
 
     if (args.stage == "evaluate" and not args.whitening_model
             and not args.oracle_attack_whitening):
@@ -510,28 +630,51 @@ def main(args):
     attacks = _attack_specs(args)
     generation_dir = _generation_dir(args)
     references, labels = _load_references_and_labels(generation_dir)
+    required_diff_indices = []
+    if args.stage in ("fit", "all"):
+        required_diff_indices.extend(
+            range(args.fit_start, min(args.fit_start + args.fit_count, len(labels)))
+        )
+    if args.stage in ("evaluate", "all"):
+        required_diff_indices.extend(
+            range(args.eval_start, min(args.eval_start + args.eval_count, len(labels)))
+        )
+    _require_diff_results(args, attacks, required_diff_indices)
     config = _inversion_config(args)
+    load_profiler = RuntimeProfiler(args.device)
+    load_profiler.start_model_load()
     pipe = _load_pipe(args)
+    model_load_seconds = load_profiler.finish_model_load()
     cache = FeatureCache(_experiment_dir(args) / "feature_cache")
     fitted_paths: Dict[str, Path] = {}
 
     if args.stage in ("fit", "all"):
-        if args.oracle_attack_whitening:
-            for attack in attacks:
-                path = _oracle_model_path(args, config, attack)
-                fitted_paths[attack.slug] = _fit(
-                    pipe, cache, args, config, [attack], references, labels, path
+        profiler = _start_stage_profiler(pipe, args, model_load_seconds)
+        try:
+            if args.oracle_attack_whitening:
+                for attack in attacks:
+                    path = _oracle_model_path(args, config, attack)
+                    fitted_paths[attack.slug] = _fit(
+                        pipe, cache, args, config, [attack], references, labels, path,
+                        profiler=profiler,
+                    )
+            else:
+                model_path = (
+                    _resolve_model_path(args.whitening_model)
+                    if args.whitening_model
+                    else _default_model_path(args, config, attacks, args.whitening_name)
                 )
-        else:
-            model_path = (
-                _resolve_model_path(args.whitening_model)
-                if args.whitening_model
-                else _default_model_path(args, config, attacks, args.whitening_name)
-            )
-            shared_path = _fit(
-                pipe, cache, args, config, attacks, references, labels, model_path
-            )
-            fitted_paths = {attack.slug: shared_path for attack in attacks}
+                shared_path = _fit(
+                    pipe, cache, args, config, attacks, references, labels, model_path,
+                    profiler=profiler,
+                )
+                fitted_paths = {attack.slug: shared_path for attack in attacks}
+        except Exception:
+            profiler.close()
+            raise
+        _finish_stage_profiler(
+            profiler, args, config, attacks, "fit", model_reused=False
+        )
 
     if args.stage in ("evaluate", "all"):
         if args.whitening_model:
@@ -551,18 +694,32 @@ def main(args):
                 "once, then pass that same file to every attack. Use "
                 "--oracle_attack_whitening only for the explicitly labelled oracle diagnostic."
             )
-        for attack in attacks:
-            _evaluate(
-                pipe, cache, args, config, attack, references, labels,
-                evaluation_paths[attack.slug],
-            )
+        reused = args.stage == "all"
+        profiler = _start_stage_profiler(
+            pipe, args, 0.0 if reused else model_load_seconds
+        )
+        try:
+            for attack in attacks:
+                _evaluate(
+                    pipe, cache, args, config, attack, references, labels,
+                    evaluation_paths[attack.slug], profiler=profiler,
+                )
+        except Exception:
+            profiler.close()
+            raise
+        _finish_stage_profiler(
+            profiler, args, config, attacks, "evaluate", model_reused=reused
+        )
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description="SFWMark HSQR research runner")
     parser.add_argument("--experiment", choices=sorted(EXPERIMENTS), required=True)
     parser.add_argument(
-        "--stage", choices=("generate", "fit", "evaluate", "all", "summarize"),
+        "--stage", choices=(
+            "generate", "diff_attack", "fit", "evaluate", "all",
+            "summarize", "summarize_runtime",
+        ),
         required=True,
     )
     parser.add_argument("--dataset_id", choices=("coco", "Gustavo", "DB1k"), required=True)
@@ -570,10 +727,19 @@ def build_parser():
     parser.add_argument("--sample_start", type=int, default=0)
     parser.add_argument("--sample_count", type=int)
     parser.add_argument("--save_gt_latents", action="store_true")
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Explicitly overwrite existing diffusion-regeneration outputs",
+    )
 
     parser.add_argument("--model_id", default="stabilityai/stable-diffusion-2-1-base")
     parser.add_argument("--model_revision")
     parser.add_argument("--local_files_only", action="store_true")
+    parser.add_argument(
+        "--diff_attack_model_id", default="stabilityai/stable-diffusion-2-1"
+    )
+    parser.add_argument("--diff_attack_model_revision", default="fp16")
+    parser.add_argument("--diff_attack_local_files_only", action="store_true")
     parser.add_argument(
         "--torch_dtype", choices=("float32", "float16", "bfloat16"), default="float32"
     )

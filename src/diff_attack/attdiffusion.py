@@ -4,6 +4,7 @@ import os
 from tqdm import tqdm
 import numpy as np
 from dataclasses import dataclass
+from typing import Callable, List, Optional, Union
 import PIL
 
 from diffusers import StableDiffusionPipeline

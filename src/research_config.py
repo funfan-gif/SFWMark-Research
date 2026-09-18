@@ -9,8 +9,8 @@ class FreeUConfig:
     enabled: bool = False
     s1: float = 0.9
     s2: float = 0.2
-    b1: float = 1.1
-    b2: float = 1.2
+    b1: float = 1.4
+    b2: float = 1.6
 
 
 @dataclass(frozen=True)
