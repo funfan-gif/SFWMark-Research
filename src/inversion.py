@@ -53,6 +53,8 @@ class InversionConfig:
         result = asdict(self)
         # Diagnostics only change logging, never recovered features.
         result.pop("diagnostics", None)
+        if self.method == "gnri":
+            result["gnri_execution"] = "per_sample_v2"
         result["prompt"] = list(self.prompt) if not isinstance(self.prompt, str) else self.prompt
         if self.negative_prompt is not None and not isinstance(self.negative_prompt, str):
             result["negative_prompt"] = list(self.negative_prompt)
@@ -289,7 +291,24 @@ def _ddim_timestamp_log_probability(inverse, value: torch.Tensor,
     return -0.5 * (value - mean).square() / variance
 
 
-def gnri_invert(pipe, images, config: InversionConfig) -> torch.Tensor:
+def gnri_invert(pipe, images, config: InversionConfig, provenance=None) -> torch.Tensor:
+    """Execute the approved scalar Newton solve independently for every image."""
+    images = _as_image_list(images)
+    results = []
+    for index, image in enumerate(images):
+        from dataclasses import replace
+        single = replace(
+            config,
+            prompt=config.prompt if isinstance(config.prompt, str) else config.prompt[index],
+            negative_prompt=(config.negative_prompt if config.negative_prompt is None
+                             or isinstance(config.negative_prompt, str)
+                             else config.negative_prompt[index]),
+        )
+        results.append(_gnri_single(pipe, [image], single, provenance))
+    return torch.cat(results, dim=0)
+
+
+def _gnri_single(pipe, images, config: InversionConfig, provenance=None) -> torch.Tensor:
     """Official-semantics GNRI adaptation for DDIM / Stable Diffusion 2.1.
 
     Like the official ICLR 2025 implementation, U-Net prediction and the
@@ -308,6 +327,11 @@ def gnri_invert(pipe, images, config: InversionConfig) -> torch.Tensor:
         pipe, config.prompt, config.negative_prompt, latent.shape[0], config.guidance_scale
     )
     inverse, _ = _make_schedulers(pipe, config.num_inference_steps)
+    report = {"gnri_execution": "per_sample_v2", "timesteps": [],
+              "iterations_per_timestep": [], "root_residuals": [],
+              "objectives": [], "converged": True, "non_finite": False,
+              "hit_max_iterations": False, "failure_reason": None,
+              "total_newton_iterations": 0}
 
     for timestep in inverse.timesteps:
         target = latent.detach()
@@ -315,8 +339,11 @@ def gnri_invert(pipe, images, config: InversionConfig) -> torch.Tensor:
         dimension = candidate[0].numel()
         best = candidate
         best_objective = float("inf")
+        best_root = float("inf")
+        step_converged = False
 
         for iteration in range(config.gnri_max_iterations):
+            report["total_newton_iterations"] += 1
             candidate = candidate.detach().requires_grad_(True)
             # Official GNRI semantics: the learned model and implicit mapping
             # are constants for the component-wise Newton derivative.
@@ -344,7 +371,9 @@ def gnri_invert(pipe, images, config: InversionConfig) -> torch.Tensor:
             if objective_score.item() < best_objective:
                 best = implicit_map.detach()
                 best_objective = objective_score.item()
+                best_root = root_residual.max().item()
             if root_residual.max().item() <= config.gnri_tolerance:
+                step_converged = True
                 _diagnostic(
                     config.diagnostics,
                     "gnri_iteration",
@@ -359,6 +388,8 @@ def gnri_invert(pipe, images, config: InversionConfig) -> torch.Tensor:
 
             gradient = torch.autograd.grad(objective.sum(), candidate, only_inputs=True)[0]
             denominator = gradient + config.gnri_eta
+            if not bool(torch.isfinite(denominator).all().item()) or bool((denominator == 0).any().item()):
+                report["failure_reason"] = "unstable_newton_denominator"
             # Component-wise Newton update from the official code:
             # x <- x - (1 / D) * objective / grad(objective), D=4*64*64.
             update = (objective / float(dimension)) / denominator
@@ -381,10 +412,28 @@ def gnri_invert(pipe, images, config: InversionConfig) -> torch.Tensor:
                 non_finite=non_finite,
             )
             if non_finite:
+                report["non_finite"] = True
+                report["failure_reason"] = report["failure_reason"] or "non_finite_newton_update"
                 break
             candidate = next_candidate
 
         latent = best.detach()
+        report["timesteps"].append(int(timestep))
+        report["iterations_per_timestep"].append(iteration + 1)
+        report["root_residuals"].append(best_root if best_root != float("inf") else None)
+        report["objectives"].append(best_objective if best_objective != float("inf") else None)
+        report["converged"] = report["converged"] and step_converged
+        report["hit_max_iterations"] |= not step_converged and iteration + 1 == config.gnri_max_iterations
+    report["final_root_residual"] = report["root_residuals"][-1]
+    report["best_objective"] = report["objectives"][-1]
+    report["finite_output"] = bool(torch.isfinite(latent).all().item())
+    if not report["finite_output"]:
+        report["failure_reason"] = "non_finite_output"
+    # Budget exhaustion is recorded separately from numerical execution failure.
+    # This budgeted solver need not reach tolerance at every diffusion timestep.
+    report["inversion_success"] = report["failure_reason"] is None
+    if provenance is not None:
+        provenance.append(report)
     return latent
 
 
@@ -397,6 +446,7 @@ def invert_image(pipe, images, method: str = "ddim", **kwargs) -> torch.Tensor:
 
     if "method" in kwargs:
         raise TypeError("Pass method only through invert_image(..., method=...)")
+    provenance = kwargs.pop("provenance", None)
     config = InversionConfig(method=method, **kwargs)
     configure_freeu(pipe, config.inversion_freeu)
 
@@ -405,5 +455,5 @@ def invert_image(pipe, images, method: str = "ddim", **kwargs) -> torch.Tensor:
     if method == "exact_ddim":
         return exact_ddim_invert(pipe, images, config)
     if method == "gnri":
-        return gnri_invert(pipe, images, config)
+        return gnri_invert(pipe, images, config, provenance=provenance)
     raise ValueError(f"Unknown inversion method: {method}")

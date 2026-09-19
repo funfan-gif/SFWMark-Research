@@ -29,7 +29,7 @@ def _verification(no_wm_distance, wm_distance):
     return {
         "AUC": float(auc(fpr, tpr)),
         "MaxAcc": float(1.0 - np.min((fpr + (1.0 - tpr)) / 2.0)),
-        "TPR@1%FPR": float(np.max(tpr[fpr <= 0.01])) if np.any(fpr <= 0.01) else 0.0,
+        "TPR@1%FPR": float(np.max(tpr[fpr < 0.01])) if np.any(fpr < 0.01) else 0.0,
     }
 
 

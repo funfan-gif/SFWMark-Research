@@ -30,10 +30,10 @@ def extract_hsqr_complex(recovered_z_t: torch.Tensor, center: bool = True,
 
     if center:
         spatial = recovered_z_t[..., CENTER_START:CENTER_END, CENTER_START:CENTER_END]
-        spectrum = torch.fft.fftshift(torch.fft.fft2(spatial), dim=(-1, -2))
+        spectrum = torch.fft.fftshift(torch.fft.fft2(spatial.float()), dim=(-1, -2))
         region = spectrum[:, channel, 1:1 + HSQR_QR_SIZE, 23:23 + HSQR_HALF_WIDTH]
     else:
-        spectrum = torch.fft.fftshift(torch.fft.fft2(recovered_z_t), dim=(-1, -2))
+        spectrum = torch.fft.fftshift(torch.fft.fft2(recovered_z_t.float()), dim=(-1, -2))
         center_row = spectrum.shape[-2] // 2
         region = spectrum[
             :, channel,
@@ -138,7 +138,7 @@ class HSQRDistanceModel:
             raise ValueError("At least two fitting residuals are required")
         residuals = queries - references
 
-        estimator = LedoitWolf(assume_centered=False).fit(residuals)
+        estimator = LedoitWolf(assume_centered=False, store_precision=False).fit(residuals)
         self.residual_mean = np.asarray(estimator.location_, dtype=np.float64)
         covariance = np.asarray(estimator.covariance_, dtype=np.float64)
         diagonal = np.diag(covariance).copy()

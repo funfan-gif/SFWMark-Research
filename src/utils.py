@@ -198,6 +198,8 @@ def get_text_dataset(dataset_id):
 # [Fourier transforms]
 def fft(input_tensor):
     assert len(input_tensor.shape) == 4
+    if input_tensor.shape[-2:] == (44, 44) and input_tensor.dtype in (torch.float16, torch.bfloat16):
+        input_tensor = input_tensor.float()
     return torch.fft.fftshift(torch.fft.fft2(input_tensor), dim=(-1, -2))
 
 def ifft(input_tensor):
@@ -207,6 +209,8 @@ def ifft(input_tensor):
 @torch.no_grad()
 def rfft(input_tensor):
     assert len(input_tensor.shape) == 4
+    if input_tensor.dtype in (torch.float16, torch.bfloat16):
+        input_tensor = input_tensor.float()
     return torch.fft.fftshift(torch.fft.rfft2(input_tensor, dim=(-2,-1)), dim=-2)
 
 @torch.no_grad()
@@ -410,7 +414,8 @@ def qr_abs(boolean_tensor, input_tensor, delta=0): # boolean → qr_abs tensor
 @torch.no_grad()
 def inject_hsqr(inverted_latent, qr_tensor, center=False, device="cuda"): # (N,4,64,64) -> (N,4,64,64)
     assert len(qr_tensor.shape) == 4 # (N,c_wm,42,42)
-    inverted_latent = inverted_latent.to(device)
+    original_dtype = inverted_latent.dtype
+    inverted_latent = inverted_latent.to(device).float()
     qr_tensor = qr_tensor.to(device)
     qr_pix_len = qr_tensor.shape[-1]    # 42
     qr_pix_half = (qr_pix_len + 1) // 2 # 21
@@ -429,7 +434,7 @@ def inject_hsqr(inverted_latent, qr_tensor, center=False, device="cuda"): # (N,4
         center_latent_ifft = irfft(torch.complex(center_real_batch, center_imag_batch)) # (N,4,44,44) f32
         inverted_latent = inverted_latent.clone()
         inverted_latent[center_slice] = center_latent_ifft
-        return inverted_latent # (N,4,64,64)
+        return inverted_latent.to(original_dtype) # FFT FP32; FP32 path unchanged.
     else:
         # Coordinates for HSQR injection
         center_row = inverted_latent.shape[-2] // 2 # 32
@@ -448,7 +453,7 @@ def inject_hsqr(inverted_latent, qr_tensor, center=False, device="cuda"): # (N,4
         #center=False [:,[3],11:53,1:22] (N,1,42,21)
         real_batch[real_slice] = qr_abs(qr_left, real_batch[real_slice], delta=delta) # (N,c_wm,42,21)
         imag_batch[imag_slice] = qr_abs(qr_right, imag_batch[imag_slice], delta=delta) # (N,c_wm,42,21)
-        return irfft(torch.complex(real_batch, imag_batch)) # (N,4,64,64)
+        return irfft(torch.complex(real_batch, imag_batch)).to(original_dtype)
 
 # ====================================================================================================
 
@@ -469,8 +474,26 @@ class RandomCropWithOriginalPosition:
         padded_img.paste(cropped_img, (left, top))
         return padded_img
 
-vaeb = bmshj2018_hyperprior(quality=3, pretrained=True).to("cuda").eval()
-vaec = cheng2020_anchor(quality=3, pretrained=True).to("cuda").eval()
+class _LazyModel:
+    """Retain the legacy interface without loading unused GPU weights."""
+    def __init__(self, factory):
+        self.factory, self.model = factory, None
+
+    def _get(self):
+        if self.model is None:
+            with torch.random.fork_rng():
+                self.model = self.factory()
+        return self.model
+
+    def __getattr__(self, name):
+        return getattr(self._get(), name)
+
+    def __call__(self, *args, **kwargs):
+        return self._get()(*args, **kwargs)
+
+
+vaeb = _LazyModel(lambda: bmshj2018_hyperprior(quality=3, pretrained=True).to("cuda").eval())
+vaec = _LazyModel(lambda: cheng2020_anchor(quality=3, pretrained=True).to("cuda").eval())
 @torch.no_grad()
 def image_distortion(img1, img2, seed, 
                      brightness_factor = None, 
@@ -721,7 +744,7 @@ def get_ssim(img1, img2):
     ssim_value, _ = ssim(img1, img2, full=True)
     return ssim_value
 
-loss_fn = lpips.LPIPS(net="vgg").to(device)
+loss_fn = _LazyModel(lambda: lpips.LPIPS(net="vgg").to(device))
 @torch.no_grad()
 def get_lpips(img1, img2, device="cuda"):
     # caluclate LPIPS(VGG): image should be RGB, normalized to [-1,1]

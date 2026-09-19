@@ -22,6 +22,8 @@ def main(args):
     if not output_root.is_absolute():
         output_root = project_root / output_root
     save_dir = output_root / args.dataset_id / args.wm_type
+    if any((save_dir / name).exists() for name in ("generation_manifest.json", "generation_config.json", "_formal_frozen.json")):
+        raise ValueError("This pool belongs to an immutable formal generation protocol; use --formal with its manifests")
     os.makedirs(os.path.join(save_dir, "img_pil"), exist_ok=True)
     os.makedirs(os.path.join(save_dir, "img_pil_wm"), exist_ok=True)
 
@@ -69,6 +71,7 @@ def main(args):
     pipe = DiffusionPipeline.from_pretrained(model_id, **load_kwargs)
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
     pipe = pipe.to(target_device)
+    pipe.enable_vae_slicing()
     pipe.set_progress_bar_config(disable=True)
     configure_freeu(pipe, FreeUConfig(
         enabled=getattr(args, "generation_freeu", False),
@@ -135,6 +138,9 @@ def main(args):
             "b2": getattr(args, "freeu_b2", FREEU_DEFAULTS.b2),
         },
         "save_gt_latents": save_gt_latents,
+        "vae_slicing": True,
+        "model_dtype": dtype_name,
+        "fft_dtype": "float32",
     }
     with open(save_dir / f"generation_manifest-{sample_start}-{sample_stop}.json", "w",
               encoding="utf-8") as handle:

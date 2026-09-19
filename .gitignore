@@ -9,6 +9,9 @@ src/text_dataset/
 outputs/
 quick_outputs/
 research_outputs/
+paper_v1/
+dev400/
+formal4024/
 
 # Python files
 z/
@@ -19,3 +22,5 @@ src/quick_start.py
 
 # etc
 # requirements.txt
+
+/docs/paper_protocol_hardening.pdf

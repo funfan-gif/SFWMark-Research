@@ -74,6 +74,11 @@ class AttackSpec:
 
 
 def _attack_specs(args) -> List[AttackSpec]:
+    if args.attack == "paper_all":
+        from copy import copy
+        rotation_args = copy(args)
+        rotation_args.attack = "all_rotations"
+        return [AttackSpec(name) for name in ORIGINAL_ATTACKS] + _attack_specs(rotation_args)
     if args.attack == "original12":
         return [AttackSpec(name) for name in ORIGINAL_ATTACKS]
     if args.attack in ORIGINAL_ATTACKS:
@@ -586,6 +591,9 @@ def _finish_stage_profiler(profiler, args, config, attacks, stage,
 
 
 def main(args):
+    if getattr(args, "formal", False):
+        from paper_runner import run
+        return run(args)
     args.git_commit = _git_commit()
     if args.stage in ("generate", "all"):
         _run_generation(args)
@@ -718,7 +726,7 @@ def build_parser():
     parser.add_argument(
         "--stage", choices=(
             "generate", "diff_attack", "fit", "evaluate", "all",
-            "summarize", "summarize_runtime",
+            "summarize", "summarize_runtime", "calibrate",
         ),
         required=True,
     )
@@ -753,7 +761,7 @@ def build_parser():
         "--attack",
         choices=tuple(ORIGINAL_ATTACKS) + (
             "original12", "rot75_nn", "rotation_bilinear", "orthogonal",
-            "all_rotations",
+            "all_rotations", "paper_all",
         ),
         default="clean",
     )
@@ -812,8 +820,21 @@ def build_parser():
         default=DEFAULT_INVERSION.gnri_max_update_norm,
     )
     parser.add_argument("--diagnostics", action="store_true")
+    parser.add_argument("--formal", action="store_true")
+    parser.add_argument("--split_manifest")
+    parser.add_argument("--split_name", choices=("fit", "calibration", "test"))
+    parser.add_argument("--generation_plan")
+    parser.add_argument("--dataset_metadata")
+    parser.add_argument("--threshold_model")
+    parser.add_argument("--generation_batch_size", type=int, default=1)
+    parser.add_argument("--cache_policy", choices=("reuse", "no_cache"), default="reuse")
+    parser.add_argument("--runtime_benchmark", action="store_true")
+    parser.add_argument("--acceptance_report", help="Clean-commit unit tests and real-model GPU smoke report required by formal mode")
     return parser
 
 
 if __name__ == "__main__":
-    main(build_parser().parse_args())
+    import sys
+    arguments = build_parser().parse_args()
+    arguments.explicit_arguments = {v.split("=", 1)[0][2:] for v in sys.argv[1:] if v.startswith("--")}
+    main(arguments)

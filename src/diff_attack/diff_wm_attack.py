@@ -67,6 +67,8 @@ def run_diffusion_attack(args):
         project_root = Path(__file__).resolve().parent.parent.parent
         output_root = project_root / output_root
     pool_dir = output_root / args.dataset_id / args.wm_type
+    if any((pool_dir / name).exists() for name in ("generation_manifest.json", "generation_config.json", "_formal_frozen.json")):
+        raise ValueError("Frozen/formal generation pool: use research_hsqr.py --formal --stage diff_attack")
     no_output_dir = pool_dir / "img_pil-diffatt_fp16"
     wm_output_dir = pool_dir / "img_pil_wm-diffatt_fp16"
     no_output_dir.mkdir(parents=True, exist_ok=True)
@@ -80,6 +82,18 @@ def run_diffusion_attack(args):
         pool_dir, indices, "img_pil_wm", "img_pil_wm-diffatt_fp16"
     )
     overwrite = bool(getattr(args, "overwrite", False))
+    from paper_protocol import file_hash, load_document, require_equal, write_once, artifact
+    attack_config = {"model_id": args.diff_attack_model_id,
+                     "model_revision": _revision(args.diff_attack_model_revision),
+                     "noise_step": BASELINE_NOISE_STEP, "batch_size": BASELINE_BATCH_SIZE,
+                     "dtype": "float16", "protocol": "legacy_diff_provenance_v2"}
+    for source, output in zip(no_inputs + wm_inputs, no_outputs + wm_outputs):
+        if output.exists() and not overwrite:
+            record_path = output.with_suffix(".provenance.json")
+            record = load_document(record_path)
+            require_equal(record, {"source_image_sha256": file_hash(source),
+                "config": attack_config, "output_sha256": file_hash(output)},
+                "Existing Diff result; use --overwrite to regenerate legacy outputs")
     pending_count = sum(overwrite or not path.is_file() for path in no_outputs)
     pending_count += sum(overwrite or not path.is_file() for path in wm_outputs)
     skipped_count = 2 * len(indices) - pending_count
@@ -131,6 +145,17 @@ def run_diffusion_attack(args):
         profiler.record_processed_images(pending_count)
         profiler.finish_processing()
         profiler.close()
+        for source, output in zip(no_inputs + wm_inputs, no_outputs + wm_outputs):
+            record_path = output.with_suffix(".provenance.json")
+            record = {"source_image_sha256": file_hash(source), "config": attack_config,
+                      "source_generation_manifest_sha256": "legacy_unverified",
+                      "output_sha256": file_hash(output)}
+            if overwrite and record_path.exists():
+                # Explicit legacy overwrite retains old provenance as a hash-named audit record.
+                old = load_document(record_path)
+                write_once(record_path.with_name(record_path.stem + '-' + old['sha256'] + '.json'), old)
+                record_path.unlink()
+            write_once(record_path, record)
     else:
         profiler.model_load_seconds = 0.0
         profiler.start_processing()

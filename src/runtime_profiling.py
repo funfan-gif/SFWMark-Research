@@ -139,6 +139,12 @@ class RuntimeProfiler:
             if self.num_images > 0 and self.inversion_processing_seconds > 0 else None
         )
         return {
+            "inversion_total_seconds": self.inversion_processing_seconds,
+            "inversion_seconds_per_processed_image": inversion_seconds_per_image,
+            "num_requested": self.requested_images,
+            "num_cache_hits": self.cache_hit_images,
+            "num_actual_inverted": self.num_images,
+            "unet_calls_per_actually_inverted_image": calls_per_image,
             "num_images": self.num_images,
             "requested_images": self.requested_images,
             "cache_hit_images": self.cache_hit_images,
