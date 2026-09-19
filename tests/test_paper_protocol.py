@@ -326,6 +326,88 @@ class ProtocolTests(unittest.TestCase):
 
 @unittest.skipUnless(has_modules("torch", "diffusers", "torchvision"), "Torch/Diffusers/torchvision not installed; no dependency installation authorized")
 class TorchAcceptanceTests(unittest.TestCase):
+    def _gnri_boundary_case(self, bad_gradient=None):
+        """Real scalar Newton/autograd; stub only the image/model/scheduler IO."""
+        from contextlib import ExitStack
+        from types import SimpleNamespace
+        from PIL import Image
+        import torch
+        import inversion
+        initial = torch.zeros(1, 4, 2, 2)
+        mapped = torch.ones_like(initial)
+        mapped.flatten()[0] = 0  # One exactly satisfied component, others not.
+        candidates, reports = [], []
+        def predict(pipe, scheduler, candidate, *args):
+            candidates.append(candidate.detach().clone())
+            return candidate
+        scheduler = SimpleNamespace(timesteps=[0],
+            step=lambda *args: SimpleNamespace(prev_sample=mapped.clone()))
+        config = inversion.InversionConfig(method="gnri")  # Formal defaults unchanged.
+        with ExitStack() as stack:
+            for name, kwargs in (
+                ("encode_images", {"return_value": initial}),
+                ("_encode_prompt", {"return_value": None}),
+                ("_make_schedulers", {"return_value": (scheduler, None)}),
+                ("_predict_model_output", {"side_effect": predict}),
+                ("_ddim_timestamp_log_probability", {"side_effect": lambda *args: torch.zeros_like(initial)}),
+            ):
+                stack.enter_context(patch.object(inversion, name, **kwargs))
+            if bad_gradient is not None:
+                # abs(root) normally cannot have zero gradient at nonzero root
+                # with eta=0; inject a faulty derivative to test rejection.
+                gradient = torch.zeros_like(initial)
+                if bad_gradient == "non_finite":
+                    gradient.flatten()[1] = float("nan")
+                stack.enter_context(patch.object(torch.autograd, "grad", return_value=(gradient,)))
+            result = inversion.gnri_invert(None, Image.new("RGB", (8, 8)), config, reports)
+        return result, reports[0], candidates, mapped
+
+    def test_gnri_zero_gradient_at_exact_root_is_safe(self):
+        import torch
+        result, report, candidates, _ = self._gnri_boundary_case()
+        self.assertTrue(torch.isfinite(result).all())
+        self.assertGreaterEqual(len(candidates), 2)
+        for candidate in candidates:
+            self.assertTrue(torch.isfinite(candidate).all())
+            self.assertEqual(candidate.flatten()[0].item(), 0.)
+        # Initial root=[0,1,...,1]: objective/D=15/16, gradient=-1
+        # outside the exact root. Check the original formula is unchanged.
+        update = candidates[0] - candidates[1]
+        self.assertEqual(update.flatten()[0].item(), 0.)
+        torch.testing.assert_close(update.flatten()[1:], torch.full((15,), -15 / 16))
+        self.assertGreater(report["zero_gradient_exact_root_components"], 0)
+        self.assertEqual(report["unexpected_zero_denominator_components"], 0)
+        self.assertFalse(report["non_finite_denominator"])
+        self.assertFalse(report["non_finite"])
+        self.assertTrue(report["inversion_success"])
+        self.assertIsNone(report["failure_reason"])
+        self.assertEqual(report["gnri_execution"], "per_sample_v2")
+
+    def test_gnri_zero_gradient_with_nonzero_root_fails(self):
+        import torch
+        result, report, candidates, best = self._gnri_boundary_case("zero")
+        self.assertEqual(len(candidates), 1)  # Stop before any invalid update.
+        torch.testing.assert_close(result, best)
+        self.assertEqual(report["failure_reason"], "unexpected_zero_newton_denominator")
+        self.assertEqual(report["unexpected_zero_denominator_components"], 15)
+        self.assertEqual(report["zero_gradient_exact_root_components"], 1)
+        self.assertFalse(report["inversion_success"])
+        run, raw = ProtocolTests.toy_raw(self)
+        raw["records"][0]["wm"].update(report)
+        with self.assertRaisesRegex(ValueError, "Formal summary refused"):
+            validate_raw(run, raw)  # Same raw validator used by paper_gate.
+
+    def test_gnri_non_finite_denominator_fails_before_update(self):
+        import torch
+        result, report, candidates, best = self._gnri_boundary_case("non_finite")
+        self.assertEqual(len(candidates), 1)
+        torch.testing.assert_close(result, best)
+        self.assertTrue(torch.isfinite(result).all())
+        self.assertTrue(report["non_finite_denominator"])
+        self.assertTrue(report["non_finite"])
+        self.assertFalse(report["inversion_success"])
+        self.assertEqual(report["failure_reason"], "non_finite_newton_denominator")
+
     def test_gnri_batch_independence(self):
         import torch
         import inversion

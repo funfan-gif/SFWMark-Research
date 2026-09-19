@@ -331,6 +331,9 @@ def _gnri_single(pipe, images, config: InversionConfig, provenance=None) -> torc
               "iterations_per_timestep": [], "root_residuals": [],
               "objectives": [], "converged": True, "non_finite": False,
               "hit_max_iterations": False, "failure_reason": None,
+              "zero_gradient_exact_root_components": 0,
+              "unexpected_zero_denominator_components": 0,
+              "non_finite_denominator": False,
               "total_newton_iterations": 0}
 
     for timestep in inverse.timesteps:
@@ -388,11 +391,25 @@ def _gnri_single(pipe, images, config: InversionConfig, provenance=None) -> torc
 
             gradient = torch.autograd.grad(objective.sum(), candidate, only_inputs=True)[0]
             denominator = gradient + config.gnri_eta
-            if not bool(torch.isfinite(denominator).all().item()) or bool((denominator == 0).any().item()):
-                report["failure_reason"] = "unstable_newton_denominator"
+            if not bool(torch.isfinite(denominator).all().item()):
+                report["non_finite_denominator"] = True
+                report["non_finite"] = True
+                report["failure_reason"] = "non_finite_newton_denominator"
+                break  # Keep best; never divide by a non-finite denominator.
+            zero_mask = denominator == 0
+            exact_root = root.detach() == 0
+            report["zero_gradient_exact_root_components"] += int((zero_mask & exact_root).sum().item())
+            unexpected_zeros = int((zero_mask & ~exact_root).sum().item())
+            report["unexpected_zero_denominator_components"] += unexpected_zeros
+            if unexpected_zeros:
+                report["failure_reason"] = "unexpected_zero_newton_denominator"
+                break  # A zero gradient away from an exact root is a failure.
+            safe_denominator = torch.where(zero_mask, torch.ones_like(denominator), denominator)
             # Component-wise Newton update from the official code:
             # x <- x - (1 / D) * objective / grad(objective), D=4*64*64.
-            update = (objective / float(dimension)) / denominator
+            # Exact-root zero subgradients are already-satisfied components.
+            update = (objective / float(dimension)) / safe_denominator
+            update = torch.where(zero_mask, torch.zeros_like(update), update)
 
             if config.gnri_max_update_norm is not None:
                 flat_norm = update.float().flatten(1).norm(dim=1).clamp_min(1e-12)

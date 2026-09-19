@@ -74,6 +74,16 @@
 
 ### 两个必须明确的统计语义
 
+GNRI 数值边界定向修正：`exact-root zero subgradient`（denominator==0 且对应 root==0）属于已满足分量，其 update=0，不是 inversion failure。先检查 denominator 有限性和 zero-mask 对应的 root，再使用 safe denominator；不先执行除零再掩盖结果。其余非零分母分量仍使用原 scalar Newton 公式。
+
+non-finite denominator 记录 `failure_reason=non_finite_newton_denominator`；zero-gradient with nonzero root 记录 `failure_reason=unexpected_zero_newton_denominator`。这两种情况都在除法之前停止当前 Newton step，保留已有 best latent，并维持数值失败状态，正式 gate 仍拒绝。
+
+新增审计字段：`zero_gradient_exact_root_components` 和 `unexpected_zero_denominator_components` 为该图所有实际执行 Newton 迭代中观察到的分量次数累计（同一坐标可重复计数，不是唯一坐标数）；`non_finite_denominator` 为是否观察到非有限分母的布尔值。保留 `gnri_execution=per_sample_v2`。这是数值边界定义，不是 GNRI 算法创新或超参数修改：eta=0、step_scale、lambda、max_iterations 均未调整。
+
+对应新增两项 exact-root/异常零分母测试，并额外覆盖非有限分母提前退出；测试调用实际 GNRI Newton 路径，替换模型/调度器输入，不下载模型。此前验收表的21项是本修正前的历史记录，不能当作这三个新测试已在4090通过的证据；修正后需要重新执行 unit tests 和小规模 GPU smoke。
+
+本次数值边界修正的本地验证：全套24项，17通过、7 skipped、0失败；本机缺少 Torch/Diffusers/torchvision/SciPy/sklearn，新增三项数值测试未实际执行。50个Python文件语法检查和 diff whitespace 检查通过。未安装依赖、运行GPU实验、commit或push。
+
 1. GNRI **数值执行成功不等于每步收敛**。预算用尽但输出有限，会记录 `converged=false`、`hit_max_iterations=true`，不会伪报收敛；当前保持原预算型 solver 的输出语义，不把未达 tolerance 自动改成另一种算法。非有限更新/输出、异常分母、异常执行、缺失分数属于失败，正式统计拒绝。表内 `n_nonconverged` 统计未完全收敛的图数（no-wm/wm 各算一图），需在论文方法与限制中报告。
 2. `TPR@1%FPR` 是 test ROC 上用于基线比较的曲线指标；`Frozen TPR/FPR/Balanced Accuracy` 使用独立 calibration 冻结的阈值。后者不使用 test 来选阈值。2000 个 calibration negatives 最多允许19个严格小于阈值；并列距离整体排除。
 
