@@ -1,0 +1,9 @@
+# Incremental evaluator dependency only; do NOT reinstall requirements.txt.
+# First inspect the active sfw environment and freeze its installed packages as
+# pip constraints, then dry-run the resolver. See docs/freeu_quality_eval.md.
+# The resolver must not change existing torch, torchvision, CUDA, diffusers,
+# compressai, transformers, or other installed packages. On conflict clone sfw.
+# Official v0.1.15 accepts torch>=1.13, torchvision>=0.13 and
+# transformers>=4.36.1,<5.0, unlike older PyIQA's transformers==4.37.2 pin.
+# Repository-bundled src/open_clip is used for CLIP; do not add open_clip_torch.
+pyiqa==0.1.15
