@@ -1,0 +1,322 @@
+\documentclass[10pt,twocolumn,letterpaper]{article}
+\usepackage[UTF8,fontset=none,scheme=plain,heading=true]{ctex}
+\usepackage[margin=.75in,columnsep=.25in]{geometry}
+\setmainfont{texgyretermes-regular.otf}[
+  BoldFont=texgyretermes-bold.otf,
+  ItalicFont=texgyretermes-italic.otf,
+  BoldItalicFont=texgyretermes-bolditalic.otf]
+\setsansfont{texgyreheros-regular.otf}[
+  BoldFont=texgyreheros-bold.otf,
+  ItalicFont=texgyreheros-italic.otf,
+  BoldItalicFont=texgyreheros-bolditalic.otf]
+\setCJKmainfont{SimSun}[AutoFakeBold=2]
+\setCJKsansfont{Microsoft YaHei}
+\usepackage{amsmath,amssymb,mathtools,microtype}
+\usepackage{graphicx,xcolor,tikz}
+\usetikzlibrary{arrows.meta,positioning,calc}
+\usepackage{algorithm,algpseudocode,enumitem}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[font=small,labelfont=bf,labelsep=period]{caption}
+\usepackage{placeins,balance}
+\usepackage[hidelinks,breaklinks]{hyperref}
+\hypersetup{pdftitle={TAIR-WM：基于反演精修与协方差感知评分的免训练水印验证框架}}
+\setlength{\emergencystretch}{2em}
+\setlength{\textfloatsep}{16pt plus 2pt minus 2pt}
+\setlength{\dbltextfloatsep}{16pt plus 2pt minus 2pt}
+\setlength{\intextsep}{14pt plus 2pt minus 2pt}
+\linespread{1.03}
+\raggedbottom
+\ctexset{
+  section={format=\large\bfseries,name={},aftername={.\enspace},
+           beforeskip=2.2ex plus .5ex minus .2ex,afterskip=1.1ex plus .2ex},
+  subsection={format=\normalsize\bfseries,
+              beforeskip=1.8ex plus .4ex minus .2ex,afterskip=.8ex plus .2ex}
+}
+\renewcommand{\abstractname}{摘要}
+\renewcommand{\refname}{参考文献}
+\renewcommand{\figurename}{图}
+\floatname{algorithm}{算法}
+\algrenewcommand\algorithmicrequire{\textbf{输入：}}
+\algrenewcommand\algorithmicfor{\textbf{循环}}
+\algrenewcommand\algorithmicdo{\textbf{执行}}
+\algrenewcommand\algorithmicif{\textbf{若}}
+\algrenewcommand\algorithmicthen{\textbf{则}}
+\algrenewcommand\algorithmicelse{\textbf{否则}}
+\algrenewcommand\algorithmicreturn{\textbf{返回}}
+\algrenewtext{EndFor}{\textbf{结束循环}}
+\algrenewtext{EndIf}{\textbf{结束条件}}
+\makeatletter
+\renewcommand{\@maketitle}{%
+  \newpage\null\vskip .5em
+  \begin{center}
+    {\LARGE\bfseries\@title\par}
+  \end{center}
+  \vskip .9em}
+\makeatother
+\title{TAIR-WM：基于反演精修与协方差感知评分的\\免训练水印验证框架}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\begin{abstract}
+频域生成式水印通过反演恢复嵌入初始噪声的结构，以验证图像是否含有指定密钥的水印。旋转引入的几何失真与数值反演误差共同削弱了模板匹配。我们提出免训练验证框架 TAIR-WM，在保持 HSQR 嵌入规则不变的条件下，结合残差引导的 Exact-DDIM 精修与协方差感知评分。前者以局部去噪重建残差修正反演步，逐图像保留已评估的最佳候选；后者以正确密钥残差的均值和 Ledoit--Wolf 收缩协方差构建 Mahalanobis 距离。进一步采用已有的 FreeU 推理时特征调制，分析生成质量与水印验证的兼容性。在十个非零双线性旋转角度上，相对于同池 DDIM/Complex-L1，联合配置将 FPR 低于 1\% 时的平均 TPR 从 G0 的 4.36\% 提高至 16.34\%，从 G1 的 4.42\% 提高至 17.78\%。含水印图像的 MUSIQ-AVA 与 LAION-Aes 平均分分别增加 0.0320 和 0.0165，CLIP 配对差值的 95\% 区间包含零。结果支持所评估配置下的小幅美学收益与旋转验证改善，同时体现出统计评分在部分常规攻击下的性能代价。G1 在生成与反演阶段均启用 FreeU，跨池差异反映这两个阶段的组合变化。
+\end{abstract}
+
+\section{引言}
+生成图像在编辑与传播后仍需能够验证其来源。水印验证（Verification）判断图像是否包含指定密钥对应的水印；多密钥识别（Identification）则需在候选集合中确定其身份。我们聚焦前一任务，研究保持嵌入机制不变时，检测端的特征恢复与残差评分如何影响几何失真后的验证能力。
+
+基于扩散反演的生成式水印将结构化图案嵌入初始噪声，再从生成图像中恢复该表示。Tree-Ring 建立了频域嵌入与反演检测的技术路线~\cite{treering2023}。SFWMark 利用 Hermitian 对称保持傅里叶完整性，并通过中心感知布局增强抗裁剪能力~\cite{sfw2025}。在其 HSQR 配置中，图像依次经过 VAE 编码、DDIM 反演和 Complex-L1 模板匹配。这些步骤使检测能力同时受嵌入结构、反演误差和评分方式影响。
+
+旋转会改变频率坐标，有限画布上的插值和边界截断还会造成信息损失。DDIM 的有限步近似进一步引入反演误差~\cite{ddim2021,exactdpm2024}，使恢复特征偏离密钥模板。Complex-L1 对各复数系数的偏差等权处理~\cite{sfw2025}，没有描述残差的系统偏移及不同方向的相关波动。因此，更一致的数值反演需要与适合正确密钥残差分布的评分结合，才能将恢复结果用于验证。
+
+我们将 Exact-DPM 的前向步修正原理~\cite{exactdpm2024}适配到一阶 DDIM 反演，以固定低噪声目标的局部重建残差指导有限步精修，并保留已评估候选中的逐图最优状态。随后，以正确密钥残差的均值与 Ledoit--Wolf 收缩协方差~\cite{ledoit2004}构造 Mahalanobis 距离。该组合分别作用于特征恢复和统计判别；局部重建一致性并不消除旋转造成的几何信息损失。
+
+图像质量也是生成模型的基本要求~\cite{ldm2022}，检测端改进因而需要放在完整生成配置中考察。FreeU 通过推理时调制 U-Net 主干与跳跃连接特征改善生成质量，无需重新训练模型权重~\cite{freeu2024}。我们将这一已有技术作为生成配置开关，在沿用 HSQR 嵌入的条件下，联合分析美学评分、图文相似度与水印验证表现。FreeU 的调制规则固定，质量评分用于事后评价；G0/G1 分别在生成和反演两个阶段关闭或开启 FreeU。
+
+具体贡献如下：
+\begin{enumerate}[leftmargin=*,itemsep=3pt,topsep=4pt]
+\item \textbf{残差引导的反演精修。} 将 Exact-DPM 前向步修正适配于 Exact-DDIM，通过有限候选评估和逐图最佳候选保留改善 HSQR 恢复的局部去噪一致性。
+\item \textbf{协方差感知的水印验证。} 基于中心化正确密钥残差与 Ledoit--Wolf 协方差估计构建 Mahalanobis 评分，研究其与 Exact-DDIM 结合时的旋转验证表现及常规攻击代价。
+\item \textbf{生成质量与水印验证的兼容性分析。} 以配对生成样本考察 FreeU 配置的质量变化，并结合对应配置的验证结果，给出质量收益、验证表现及其权衡的系统级实证分析。
+\end{enumerate}
+
+\section{相关工作}
+\subsection{生成式水印与几何鲁棒性}
+Tree-Ring 在扩散初始噪声的傅里叶域嵌入环状图案~\cite{treering2023}。SFWMark 通过 Hermitian 对称与中心感知布局保持频域完整性，其 HSQR 变体将 QR 图案编码到实、虚分量~\cite{sfw2025}。几何鲁棒性还依赖恢复后的空间对应关系：RingID 以离散环状模式与多通道嵌入增强密钥可分性~\cite{ringid2024}，SynTag 通过微调解码器嵌入同步标记，并在提取前预测和校正几何失真~\cite{syntag2025}。我们沿用 HSQR 嵌入，考察检测端数值恢复与统计评分的作用。
+
+\subsection{面向水印恢复的扩散反演}
+DDIM 提供常用的确定性反演路径~\cite{ddim2021}。Exact-DPM 将反演写为隐式求解问题，采用梯度或前向步修正，并用于水印检测~\cite{exactdpm2024}；GNRI 通过噪声先验引导 Newton--Raphson 迭代改善图像反演与编辑~\cite{gnri2025}。针对失真后的水印恢复，ROAR 将起始潜变量的再生成优化与混合专家失真恢复网络结合~\cite{roar2025}，FARI 将单步反演与对抗 LoRA 微调结合~\cite{fari2026}。TAIR-WM 固定网络权重，在一阶 DDIM 路径上执行残差精修，并利用恢复特征的统计结构完成验证。
+
+\subsection{残差建模与统计验证}
+水印验证可采用模板距离或统计判别。SFWMark 使用 Complex-L1~\cite{sfw2025}，Tree-Ring 在高斯零假设下推导检测 $p$ 值~\cite{treering2023}，Gaussian Shading 根据匹配比特数的二项分布标定阈值~\cite{gaussianshading2024}。我们对扰动后的正确密钥残差拟合均值和收缩协方差~\cite{ledoit2004}，以 Mahalanobis 距离描述残差的系统偏移、方向尺度及相关性。RingID 已讨论二元验证与多密钥识别的区别~\cite{ringid2024}；本文将统计评分用于指定密钥验证，其结果不直接推导多密钥排序能力。
+
+\subsection{推理时特征调制与生成质量}
+FreeU 分析扩散 U-Net 中主干和跳跃连接特征对去噪与细节的作用，并在推理时重加权两类特征，无需重新训练模型权重~\cite{freeu2024}。这一技术已在图像和视频生成中得到研究。SFWMark 也通过生成质量指标考察水印嵌入的影响~\cite{sfw2025}。本文关注在 HSQR 嵌入与检测端改进并存时，FreeU 配置能否获得美学评分收益，并维持相对于对应基线的旋转验证改善。
+
+\section{方法}
+\subsection{问题定义与框架概述}
+TAIR-WM 沿用 SFWMark 的 HSQR 嵌入~\cite{sfw2025}。给定待检测图像 $x$ 和调用方指定的密钥 $k$，验证器输出该图像是否包含相应水印。多密钥识别属于候选排序任务，不作为本文的主要输出。图像依次经过 VAE 编码、扩散反演和 HSQR 特征提取：
+\begin{equation}z_0=E(x),\quad\widehat z_T=I(z_0),\quad f=\Phi(\widehat z_T).\label{eq:flow}\end{equation}
+编码器 $E$ 包含基础模型的潜变量缩放，$I$ 将 $z_0$ 映射为初始噪声的恢复表示 $\widehat z_T$，$\Phi$ 提取用于密钥验证的傅里叶特征。
+
+在中心感知配置下，$\Phi$ 截取潜变量中央的 $44\!\times\!44$ 区域，执行移位二维 FFT，并从索引为 3 的通道选取 $42\!\times\!21$ 个复数系数。展平后记为 $c\in\mathbb C^m$，$m=882$，按实部和虚部排列为
+\begin{equation}f=[\operatorname{Re}(c)^\top,\operatorname{Im}(c)^\top]^\top\in\mathbb R^p,\quad p=2m=1764.\label{eq:feature}\end{equation}
+模板 $w_k$ 采用相同排列，其实部和虚部对应 QR 图案的两个半区，参考值沿用原检测器的 $\pm45$。残差记为 $r_k=f-w_k$。图~\ref{fig:framework}给出从图像到指定密钥验证的计算流程。
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+  x=1cm,y=1cm,font=\footnotesize,
+  box/.style={draw=black!65,rounded corners=2pt,align=center,
+    inner sep=4pt,line width=.5pt,fill=black!2},
+  arrow/.style={-{Latex[length=2mm]},line width=.65pt,draw=black!70},
+  control/.style={arrow,dashed}]
+\node[box,text width=1.08cm,minimum height=.85cm] (image) at (.65,0) {图像 $x$};
+\node[box,text width=1cm,minimum height=.85cm] (vae) at (2.18,0) {VAE\\编码};
+\node[draw=blue!55,fill=blue!2,rounded corners=3pt,
+  minimum width=4.65cm,minimum height=3.65cm] (exact) at (5.55,0) {};
+\node[font=\small\bfseries,text=blue!65!black] at (5.55,1.40) {Exact-DDIM 残差引导精修};
+\node[box,text width=1.12cm,minimum height=.84cm] (predict) at (4.25,.42) {DDIM\\预测器};
+\node[box,text width=1.54cm,minimum height=.84cm] (residual) at (6.64,.42) {$D(u)-\widetilde z_s$\\重建残差};
+\node[box,text width=1.85cm,minimum height=.62cm,fill=blue!6] (update) at (5.55,-.67) {$u\leftarrow u-\eta r$};
+\node[align=center,font=\small] at (5.55,-1.44) {逐图保留已评估的最佳候选\\容差停止或候选预算耗尽};
+\node[box,text width=2.12cm,minimum height=1.1cm] (feature) at (9.65,0) {HSQR 频域特征\\截取、FFT、选区\\$f\in\mathbb R^{1764}$};
+\node[box,text width=2.65cm,minimum height=1.1cm,fill=teal!5] (metric) at (12.70,0) {Mahalanobis\\$s=\|L^{-1}(r_k-\widehat\mu)\|_2$};
+\node[box,text width=1.95cm,minimum height=1.1cm,fill=teal!5] (verify) at (16.00,0) {指定密钥验证\\$\widehat y=\mathbf1[s<\gamma]$};
+\node[box,fill=blue!4,text width=4.30cm,minimum height=.56cm] (freeu) at (5.55,2.50) {G0：FreeU OFF；G1：FreeU ON};
+\node[align=left,font=\small,anchor=west] at (8.15,2.50) {生成与反演采用同一开关\\HSQR 嵌入规则保持不变};
+\node[align=center] (statistics) at (12.70,1.42) {离线正确密钥残差拟合\\$\widehat\mu,L$};
+\node[align=center] (key) at (9.65,-1.48) {指定密钥模板 $w_k$};
+\draw[arrow] (image.east)--(vae.west);
+\draw[arrow] (vae.east)--(3.05,0)|-(predict.west);
+\draw[arrow] (predict.east)--(residual.west);
+\draw[arrow] (residual.south)|-(update.east);
+\draw[arrow] (update.west)-|(predict.south);
+\draw[arrow] (exact.east)--node[above]{$\widehat z_T$}(feature.west);
+\draw[arrow] (feature.east)--(metric.west);
+\draw[arrow] (metric.east)--(verify.west);
+\draw[control] (statistics.south)--(metric.north);
+\draw[control] (key.east)-|(metric.south);
+\draw[control] (freeu.south)--(exact.north);
+\end{tikzpicture}
+\caption{TAIR-WM 验证流程。Exact-DDIM 精修恢复潜变量，HSQR 频域特征经中心化与协方差白化后完成指定密钥验证。实线为检测数据流，虚线为配置、模板或离线统计量。FreeU 在生成和反演阶段采用匹配的 ON/OFF 配置，质量评分不参与反演更新或验证决策。}
+\label{fig:framework}
+\end{figure*}
+\subsection{残差引导的 Exact-DDIM 反演}
+
+\paragraph{局部重建一致性。}
+对于相邻扩散时刻 $t>s$，确定性 DDIM 去噪映射 $D_{t\to s}$~\cite{ddim2021}在噪声预测参数化下写为
+\begin{equation}\begin{aligned}\widehat z_0(z_t)&=\frac{z_t-\sqrt{1-\bar\alpha_t}\,\epsilon_\theta(z_t,t)}{\sqrt{\bar\alpha_t}},\\D_{t\to s}(z_t)&=\sqrt{\bar\alpha_s}\,\widehat z_0(z_t)+\sqrt{1-\bar\alpha_s}\,\epsilon_\theta(z_t,t).\end{aligned}\label{eq:ddim}\end{equation}
+其中，$\epsilon_\theta$ 为噪声预测网络，$\bar\alpha_t$ 和 $\bar\alpha_s$ 为基础调度器对应时刻的系数。反演需要寻找去噪后与当前低噪声目标 $\widetilde z_s$ 一致的 $z_t$。由于网络预测依赖这一未知变量，该过程构成隐式反演问题，普通 DDIM 反演给出的近似解未必满足去噪重建一致性。为此，以单步重建误差衡量候选质量：
+\begin{equation}\mathcal L_t(z)=\frac1d\|D_{t\to s}(z)-\widetilde z_s\|_2^2.\label{eq:objective}\end{equation}
+这里 $d$ 为每幅图像的潜变量元素数。目标 $\widetilde z_s$ 在当前精修循环内保持固定，因此计算该损失不需要真实初始噪声。
+
+\paragraph{残差引导的有限步精修。}
+以普通 DDIM 反演结果初始化候选，并计算其去噪结果相对于固定目标的残差：
+\begin{equation}z_t^{(0)}=I_{s\to t}^{\mathrm{DDIM}}(\widetilde z_s),\quad r_t^{(j)}=D_{t\to s}(z_t^{(j)})-\widetilde z_s.\label{eq:residual}\end{equation}
+候选沿残差的反方向更新：
+\begin{equation}z_t^{(j+1)}=z_t^{(j)}-\eta r_t^{(j)}.\label{eq:update}\end{equation}
+式~\eqref{eq:update}沿用 Exact-DPM 的前向步修正机制~\cite{exactdpm2024}，并将其适配于 HSQR 检测中的一阶 DDIM 反演。该更新直接使用潜变量重建残差，无需对去噪器求导；它不同于式~\eqref{eq:objective}的梯度下降，后者还需引入去噪映射的 Jacobian。当前配置取步长 $\eta=0.5$，每步最多评估 $J_{\max}=5$ 个候选，残差容差为 $\tau=10^{-5}$，调度器的随机噪声参数设为零。
+
+\paragraph{停止条件与候选保留。}
+精修在批内最大残差 RMS 不超过 $\tau$，或候选评估预算耗尽时终止。采用批内最大值，使容差停止要求每幅图像均满足条件。由于残差更新不保证损失单调下降，输出不直接取最后一次更新，而是逐图像保留已评估 MSE 最小的候选：
+\begin{equation}j_b^\star=\arg\min_{j\in\mathcal J_b}\mathcal L_t(z_{t,b}^{(j)}),\quad\widetilde z_{t,b}=z_{t,b}^{(j_b^\star)}.\label{eq:best}\end{equation}
+其中，$\mathcal J_b$ 为图像 $b$ 的已评估候选集合，包含初始化；未经评估的最终更新不参与选择。只要已评估损失均为有限值，就有
+\begin{equation}\mathcal L_t(\widetilde z_{t,b})\leq\mathcal L_t(z_{t,b}^{(0)}).\label{eq:local}\end{equation}
+所选 $\widetilde z_{t,b}$ 随后作为下一反演步的目标。式~\eqref{eq:local}约束的是单步固定目标下的局部损失，不保证严格改善、全局收敛或恢复旋转中丢失的信息；Exact-DDIM 在此表示所采用的精修方法类别，不表示有限预算下的精确恢复。完整的候选评估与验证决策见算法~\ref{alg:detector}。
+
+
+\subsection{协方差感知的水印验证}
+
+局部去噪一致性约束了反演候选，但恢复后的水印特征仍可能偏离密钥模板。此类偏差既可能包含系统偏移，也可能在多个频率位置及实部、虚部之间共同变化。验证因此以正确密钥下的特征残差为建模对象，使评分反映这些偏差的尺度与相关性。
+
+对拟合特征 $f_i$ 及其已知正确模板 $w_{k_i}$，定义 $r_i=f_i-w_{k_i}$，并估计残差均值与协方差：
+\begin{equation}\widehat\mu=\frac1n\sum_{i=1}^nr_i,\quad S=\frac1n\sum_{i=1}^n(r_i-\widehat\mu)(r_i-\widehat\mu)^\top.\label{eq:stats}\end{equation}
+均值 $\widehat\mu$ 描述恢复特征相对于模板的系统偏移，$S$ 描述不同残差分量的变化及相关性。拟合样本数 $n=1024$ 小于特征维度 $p=1764$，样本协方差因而秩亏。采用 Ledoit--Wolf 收缩~\cite{ledoit2004}获得用于评分的协方差：
+\begin{equation}\begin{aligned}\widehat\Sigma&=(1-\lambda)S+\lambda aI,\quad a=\frac{\operatorname{tr}(S)}p,\\\Sigma_{\mathrm{reg}}&=\widehat\Sigma+\varepsilon I.\end{aligned}\label{eq:shrinkage}\end{equation}
+收缩系数 $\lambda$ 由拟合数据确定，非负抖动 $\varepsilon$ 仅在 Cholesky 分解需要时加入。统计量针对正确密钥残差拟合，并按反演配置分别估计。
+
+将 $\Sigma_{\mathrm{reg}}$ 分解为 $LL^\top$ 后，通过三角方程 $Lv_k=r_k-\widehat\mu$ 对中心化残差进行白化，得到 Mahalanobis 评分：
+\begin{equation}s_{\mathrm{Mah}}(r_k)=\|v_k\|_2=\sqrt{(r_k-\widehat\mu)^\top\Sigma_{\mathrm{reg}}^{-1}(r_k-\widehat\mu)}.\label{eq:mah}\end{equation}
+式~\eqref{eq:mah}给出等价的距离形式，实现中使用三角求解而不显式构造逆矩阵。该评分降低高方差方向的权重，并通过非对角项考虑相关偏移，从而衡量观测残差与拟合正确密钥群体的兼容程度；不要求为水印与无水印图像建立完整的高斯似然模型。
+
+协方差权重依据拟合分布中的重复扰动确定，其作用也受该分布约束。满秩白化本身可逆，后续范数才将残差向量压缩为标量。因此，密钥区分能力可能发生的变化与方向权重有关，不能解释为已经证明某些高频系数被删除。因此，该距离的统计含义是对指定密钥残差分布的兼容性评价。
+
+
+作为对照，原检测器的 Complex-L1 对复数系数 $c_j$ 及模板系数 $u_{k,j}$ 计算
+\begin{equation}\begin{aligned}
+s_{\mathrm{CL1}}(f,w_k)&=\frac1m\sum_{j=1}^m|c_j-u_{k,j}|,\\
+|a+ib|&=\sqrt{a^2+b^2}.
+\end{aligned}\label{eq:cl1}\end{equation}
+它对复数差的模长取均值，不单独累加实、虚部的绝对差。Mahalanobis 则用式~\eqref{eq:mah}评价中心化残差，最终输出
+\begin{equation}\widehat y=\mathbf1[s_{\mathrm{Mah}}(f-w_k)<\gamma].\label{eq:decision}\end{equation}
+阈值 $\gamma$ 由独立干净无水印校准集的距离顺序统计量确定：对每个反演配置与距离，取 2,000 个校准距离的第 20 小值，以严格小于该值判阳性，并将阈值冻结用于所有测试条件。这个经验校准规则与测试 ROC 上的低假阳性率性能是两种评价协议。均值、收缩协方差及阈值均为离线参数估计，扩散模型权重保持固定。
+
+\subsection{FreeU 与水印验证的兼容性设置}
+FreeU~\cite{freeu2024}在 U-Net 解码阶段调制主干和跳跃连接特征。我们采用已有实现，将其作为固定的推理时配置：G0 在生成与反演阶段关闭 FreeU，G1 在两个阶段均开启。开关改变 U-Net 的特征计算，HSQR 的嵌入位置、符号规则和检测模板保持一致；Exact-DDIM 的残差目标、更新与候选选择仍分别由式~\eqref{eq:objective}--\eqref{eq:best}定义，去噪映射 $D$ 使用相应配置下的网络计算。
+
+两组生成使用配对的提示词、初始潜变量种子与密钥，同一生成池内不同反演器复用图像。质量评价直接作用于保存的生成图像，不经过后续反演；验证评价则将这些图像施加攻击，再通过图~\ref{fig:framework}的流程恢复和判别。由此，可以考察含水印生成是否获得美学评分收益，以及对应配置下的反演与统计验证组合是否继续改善旋转验证。G0/G1 的验证差异同时涉及生成与反演阶段，不能单独归因于生成端调制。
+
+兼容性分析联合使用质量指标与验证指标，考察二者的收益和代价。FreeU 的系数固定，图像质量分数用于事后评测；整个流程无需质量反馈门控或水印驱动的特征调节。算法~\ref{alg:detector}给出指定密钥验证过程。
+
+\begin{algorithm}[t]
+\caption{Exact-DDIM 与协方差感知的指定密钥验证}\label{alg:detector}
+\small
+\begin{algorithmic}[1]
+\Require 图像 $x$、指定密钥 $k$、匹配的反演配置、统计量 $(\widehat\mu,L)$、阈值 $\gamma$
+\State $z\gets E(x)$
+\For{按噪声递增顺序遍历反演步 $(s,t)$}
+\State $\widetilde z_s\gets z$；$u\gets I^{\mathrm{DDIM}}_{s\to t}(\widetilde z_s)$
+\State 对每幅图像 $b$，令 $e_b^\star\gets+\infty$
+\For{$j=0,\ldots,J_{\max}-1$}
+\State $r\gets D_{t\to s}(u)-\widetilde z_s$
+\State 对每个 $b$，计算 $e_b\gets\operatorname{mean}(r_b^2)$
+\State 对满足 $e_b<e_b^\star$ 的图像 $b$：
+\State \hspace{1em}$u_b^\star\gets u_b$；$e_b^\star\gets e_b$
+\If{$\max_b\sqrt{e_b}\leq\tau$}
+\State \textbf{跳出循环}
+\EndIf
+\State $u\gets u-\eta r$
+\EndFor
+\State $z\gets u^\star$
+\EndFor
+\State $f\gets\Phi(z)$；解三角方程 $Lv=f-w_k-\widehat\mu$
+\State \Return $\mathbf1[\|v\|_2<\gamma]$
+\end{algorithmic}
+\end{algorithm}
+\FloatBarrier
+\clearpage\balance
+{\small
+\begin{thebibliography}{13}
+\interlinepenalty=10000
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Ci et~al.(2024)Ci, Yang, Song, and Shou]{ringid2024}
+Hai Ci, Pei Yang, Yiren Song, and Mike~Zheng Shou.
+\newblock {RingID}: Rethinking tree-ring watermarking for enhanced multi-key
+  identification.
+\newblock In \emph{ECCV}, pages 338--354, 2024.
+
+\bibitem[Fang et~al.(2025)Fang, Chen, Ma, Deng, Li, Zhang, and
+  Chang]{syntag2025}
+Han Fang, Kejiang Chen, Zehua Ma, Jiajun Deng, Yicong Li, Weiming Zhang, and
+  Ee-Chien Chang.
+\newblock {SynTag}: Enhancing the geometric robustness of inversion-based
+  generative image watermarking.
+\newblock In \emph{ICCV}, pages 15416--15425, 2025.
+
+\bibitem[Hong et~al.(2024)Hong, Lee, Jeon, Bae, and Chun]{exactdpm2024}
+Seongmin Hong, Kyeonghyun Lee, Suh~Yoon Jeon, Hyewon Bae, and Se~Young Chun.
+\newblock \href{https://openaccess.thecvf.com/content/CVPR2024/html/Hong_On_Exact_Inversion_of_DPM-Solvers_CVPR_2024_paper.html}{On exact inversion of {DPM}-solvers}.
+\newblock In \emph{CVPR}, pages 7069--7078, 2024.
+
+\bibitem[Ledoit and Wolf(2004)]{ledoit2004}
+Olivier Ledoit and Michael Wolf.
+\newblock A well-conditioned estimator for large-dimensional covariance
+  matrices.
+\newblock \emph{Journal of Multivariate Analysis}, 88\penalty0 (2):\penalty0
+  365--411, 2004.
+
+\bibitem[Lee and Cho(2025)]{sfw2025}
+Sung~Ju Lee and Nam~Ik Cho.
+\newblock Semantic watermarking reinvented: Enhancing robustness and generation
+  quality with Fourier integrity.
+\newblock In \emph{ICCV}, pages 18759--18769, 2025.
+
+\bibitem[Rombach et~al.(2022)Rombach, Blattmann, Lorenz, Esser, and
+  Ommer]{ldm2022}
+Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Bj{\"o}rn
+  Ommer.
+\newblock High-resolution image synthesis with latent diffusion models.
+\newblock In \emph{CVPR}, pages 10684--10695, 2022.
+
+\bibitem[Samuel et~al.(2025)Samuel, Meiri, Maron, Tewel, Darshan, Avidan,
+  Chechik, and Ben-Ari]{gnri2025}
+Dvir Samuel, Barak Meiri, Haggai Maron, Yoad Tewel, Nir Darshan, Shai Avidan,
+  Gal Chechik, and Rami Ben-Ari.
+\newblock Lightning-fast image inversion and editing for text-to-image
+  diffusion models.
+\newblock In \emph{ICLR}, 2025.
+
+\bibitem[Si et~al.(2024)Si, Huang, Jiang, and Liu]{freeu2024}
+Chenyang Si, Ziqi Huang, Yuming Jiang, and Ziwei Liu.
+\newblock \href{https://openaccess.thecvf.com/content/CVPR2024/html/Si_FreeU_Free_Lunch_in_Diffusion_U-Net_CVPR_2024_paper.html}{{FreeU}: Free lunch in diffusion {U-Net}}.
+\newblock In \emph{CVPR}, pages 4733--4743, 2024.
+
+\bibitem[Song et~al.(2021)Song, Meng, and Ermon]{ddim2021}
+Jiaming Song, Chenlin Meng, and Stefano Ermon.
+\newblock Denoising diffusion implicit models.
+\newblock In \emph{ICLR}, 2021.
+
+\bibitem[Wen et~al.(2023)Wen, Kirchenbauer, Geiping, and
+  Goldstein]{treering2023}
+Yuxin Wen, John Kirchenbauer, Jonas Geiping, and Tom Goldstein.
+\newblock Tree-rings watermarks: Invisible fingerprints for diffusion images.
+\newblock In \emph{NeurIPS}, pages 58047--58063, 2023.
+
+\bibitem[Yang et~al.(2026)Yang, Fang, Zhang, Yu, and Chen]{fari2026}
+Jindong Yang, Han Fang, Weiming Zhang, Nenghai Yu, and Kejiang Chen.
+\newblock {FARI}: Robust one-step inversion for watermarking in diffusion
+  models.
+\newblock In \emph{ICLR}, 2026.
+
+
+\bibitem[Wang et~al.(2025)Wang, Fang, Wang, and Chang]{roar2025}
+Hanyi Wang, Han Fang, Shi-Lin Wang, and Ee-Chien Chang.
+\newblock \href{https://openaccess.thecvf.com/content/ICCV2025/html/Wang_ROAR_Reducing_Inversion_Error_in_Generative_Image_Watermarking_ICCV_2025_paper.html}{ROAR: Reducing Inversion Error in Generative Image Watermarking}.
+\newblock In \emph{ICCV}, pages 19742--19751, 2025.
+
+\bibitem[Yang et~al.(2024)Yang, Zeng, Chen, Fang, Zhang, and Yu]{gaussianshading2024}
+Zijin Yang, Kai Zeng, Kejiang Chen, Han Fang, Weiming Zhang, and Nenghai Yu.
+\newblock \href{https://openaccess.thecvf.com/content/CVPR2024/html/Yang_Gaussian_Shading_Provable_Performance-Lossless_Image_Watermarking_for_Diffusion_Models_CVPR_2024_paper.html}{Gaussian Shading: Provable Performance-Lossless Image Watermarking for Diffusion Models}.
+\newblock In \emph{CVPR}, pages 12162--12171, 2024.
+
+\end{thebibliography}
+
+}
+\end{document}

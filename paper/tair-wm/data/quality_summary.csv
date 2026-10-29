@@ -1,0 +1,19 @@
+record_type,metric,generation_pool,watermark_status,n,expected_count,missing_count,mean,std,pairing_confidence,validity,contrast,n_pairs,mean_difference,ci95_low,ci95_high,g1_higher_fraction
+group,musiq-ava,G0,no_wm,1000,1000,0,5.446280128955841,0.4995136721899652,formal_image_verified_latent_hash_claims,complete,,,,,,
+group,musiq-ava,G1,no_wm,1000,1000,0,5.488538283348084,0.4921610632835878,formal_image_verified_latent_hash_claims,complete,,,,,,
+group,musiq-ava,G0,wm,1000,1000,0,5.439008170604706,0.46953584522778985,formal_image_verified_latent_hash_claims,complete,,,,,,
+group,musiq-ava,G1,wm,1000,1000,0,5.47100549197197,0.4899745845100842,formal_image_verified_latent_hash_claims,complete,,,,,,
+group,laion_aes,G0,no_wm,1000,1000,0,5.499057010173797,0.3406284014223127,formal_image_verified_latent_hash_claims,complete,,,,,,
+group,laion_aes,G1,no_wm,1000,1000,0,5.526638568401337,0.3512657974781958,formal_image_verified_latent_hash_claims,complete,,,,,,
+group,laion_aes,G0,wm,1000,1000,0,5.493650203227997,0.3286963914129056,formal_image_verified_latent_hash_claims,complete,,,,,,
+group,laion_aes,G1,wm,1000,1000,0,5.510148885726928,0.3530164660268505,formal_image_verified_latent_hash_claims,complete,,,,,,
+group,clip,G0,no_wm,1000,1000,0,0.32854684579372406,0.03846984941133532,formal_image_verified_latent_hash_claims,complete,,,,,,
+group,clip,G1,no_wm,1000,1000,0,0.32848585352301596,0.03948222573684891,formal_image_verified_latent_hash_claims,complete,,,,,,
+group,clip,G0,wm,1000,1000,0,0.3291802062690258,0.03965678957894574,formal_image_verified_latent_hash_claims,complete,,,,,,
+group,clip,G1,wm,1000,1000,0,0.330250555112958,0.03962025437099239,formal_image_verified_latent_hash_claims,complete,,,,,,
+comparison,musiq-ava,,no_wm,,,0,,,formal_image_verified_latent_hash_claims,complete,G1 minus G0,1000,0.04225815439224243,0.01720270029306412,0.06725166121721265,0.536
+comparison,musiq-ava,,wm,,,0,,,formal_image_verified_latent_hash_claims,complete,G1 minus G0,1000,0.03199732136726379,0.008106999713182449,0.055921369141340244,0.525
+comparison,laion_aes,,no_wm,,,0,,,formal_image_verified_latent_hash_claims,complete,G1 minus G0,1000,0.027581558227539063,0.011037622940540314,0.04436153492927552,0.553
+comparison,laion_aes,,wm,,,0,,,formal_image_verified_latent_hash_claims,complete,G1 minus G0,1000,0.016498682498931886,0.00035634403228759824,0.032819244575500485,0.524
+comparison,clip,,no_wm,,,0,,,formal_image_verified_latent_hash_claims,complete,G1 minus G0,1000,-6.0992270708084104e-05,-0.002019545031711459,0.0018800295431166884,0.489
+comparison,clip,,wm,,,0,,,formal_image_verified_latent_hash_claims,complete,G1 minus G0,1000,0.0010703488439321519,-0.0007441782820969818,0.0028979602366685864,0.509

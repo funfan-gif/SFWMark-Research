@@ -1,3 +1,11 @@
+## TAIR-WM 论文与写作材料
+
+[最新论文、引言、实验章节、数据与写作笔记](paper/tair-wm/README.md)（2026-10-29 整理）。
+
+以下为上游 SFWMark 的项目说明。
+
+---
+
 <div align="center">
 <h1>🧼 SFW: Symmetric Fourier Watermarking </h1>
 <!-- <h3>Semantic Watermarking Reinvented </h3> -->
